@@ -22,10 +22,16 @@ const mockOption = Options.boolean("mock").pipe(
   Options.withDescription("force the deterministic offline Gemini layer")
 )
 
+const transcriberOption = Options.choice("transcriber", ["whisper", "openai", "gemini"]).pipe(
+  Options.withDefault("whisper" as const),
+  Options.withDescription("speech-to-text backend for audio/video")
+)
+
 interface StoreConfig {
   readonly store: "sqlite" | "memory"
   readonly db: string
   readonly mock: boolean
+  readonly transcriber?: "whisper" | "openai" | "gemini"
 }
 
 const appLayer = (config: StoreConfig) => {
@@ -48,10 +54,11 @@ const ingestCommand = Command.make(
     ),
     store: storeOption,
     db: dbOption,
-    mock: mockOption
+    mock: mockOption,
+    transcriber: transcriberOption
   },
-  ({ db, mock, paths, store }) => {
-    const app = appLayer({ store, db, mock })
+  ({ db, mock, paths, store, transcriber }) => {
+    const app = appLayer({ store, db, mock, transcriber })
     return Effect.gen(function* () {
       yield* app.note
       const report = yield* ingestPaths(paths)
@@ -130,16 +137,17 @@ const serveCommand = Command.make(
     ),
     store: storeOption,
     db: dbOption,
-    mock: mockOption
+    mock: mockOption,
+    transcriber: transcriberOption
   },
-  ({ db, mock, port, store }) => {
-    const app = appLayer({ store, db, mock })
+  ({ db, mock, port, store, transcriber }) => {
+    const app = appLayer({ store, db, mock, transcriber })
     return Effect.gen(function* () {
       yield* app.note
       yield* Console.log(
         `upload-world API on http://localhost:${port} — OpenAPI docs at http://localhost:${port}/docs`
       )
-      yield* Layer.launch(serverLayer({ port, store, db, mock }))
+      yield* Layer.launch(serverLayer({ port, store, db, mock, transcriber }))
     })
   }
 ).pipe(Command.withDescription("serve the HTTP API (multipart + raw ingest, search, status)"))

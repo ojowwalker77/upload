@@ -135,16 +135,23 @@ export const GeminiLive: Layer.Layer<Gemini, ConfigError, HttpClient.HttpClient>
           { inline_data: { mime_type: mimeType, data: Buffer.from(data).toString("base64") } }
         ]),
 
-      embed: (texts, taskType) =>
-        Effect.gen(function* () {
+      embed: (texts, taskType) => {
+        // Gemini Embedding 2 dropped the taskType param: retrieval intent is
+        // expressed as a prompt prefix on queries; documents embed raw.
+        const isEmbedding2 = embeddingModel.startsWith("gemini-embedding-2")
+        const prepare = (text: string): string =>
+          isEmbedding2 && taskType === "RETRIEVAL_QUERY"
+            ? `task: search result | query: ${text}`
+            : text
+        return Effect.gen(function* () {
           const out: Array<ReadonlyArray<number>> = []
           for (let i = 0; i < texts.length; i += EMBED_BATCH) {
             const batch = texts.slice(i, i + EMBED_BATCH)
             const json = yield* post("embed", `/models/${embeddingModel}:batchEmbedContents`, {
               requests: batch.map((text) => ({
                 model: `models/${embeddingModel}`,
-                content: { parts: [{ text }] },
-                taskType,
+                content: { parts: [{ text: prepare(text) }] },
+                ...(isEmbedding2 ? {} : { taskType }),
                 outputDimensionality: embeddingDim
               }))
             })
@@ -168,6 +175,7 @@ export const GeminiLive: Layer.Layer<Gemini, ConfigError, HttpClient.HttpClient>
           }
           return out
         })
+      }
     })
   })
 )

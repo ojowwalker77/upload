@@ -1,11 +1,14 @@
 import { afterAll, describe, expect, it } from "vitest"
 import { GeminiMock } from "../src/services/GeminiMock.js"
+import { FfmpegMock, TranscriberMock } from "../src/services/mocks.js"
 import { makeWebHandler } from "../src/server.js"
 import { MemoryVectorStoreLive } from "../src/stores/memory.js"
 
 const { dispose, handler } = makeWebHandler({
   gemini: GeminiMock,
-  vectorStore: MemoryVectorStoreLive
+  vectorStore: MemoryVectorStoreLive,
+  ffmpeg: FfmpegMock,
+  transcriberLayer: TranscriberMock
 })
 
 afterAll(() => dispose())

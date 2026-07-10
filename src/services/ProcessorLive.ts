@@ -1,12 +1,15 @@
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { createHash } from "node:crypto"
 import { ProcessingError } from "../domain.js"
-import type { Chunk, IngestSource, MediaKind } from "../domain.js"
+import type { Chunk, GeminiError, IngestSource } from "../domain.js"
+import { Ffmpeg } from "./Ffmpeg.js"
 import { Gemini } from "./Gemini.js"
 import { Processor } from "./Processor.js"
+import { Transcriber } from "./Transcriber.js"
 
 const MAX_INLINE_BYTES = 19 * 1024 * 1024
 const SUMMARY_THRESHOLD = 2000
+const FRAME_CONCURRENCY = 3
 
 export interface ChunkOptions {
   readonly size?: number
@@ -49,14 +52,6 @@ export const chunkText = (text: string, options?: ChunkOptions): Array<string> =
   return chunks
 }
 
-const MEDIA_PROMPTS: Record<Exclude<MediaKind, "text" | "mix">, string> = {
-  audio: "Transcribe this audio verbatim. Then add a one-paragraph summary prefixed with 'Summary:'.",
-  video:
-    "Describe this video: scenes, key moments, on-screen text, spoken content. Be thorough and factual.",
-  image: "Describe this image in detail: subjects, text (OCR), layout, colors, context.",
-  pdf: "Extract the full text of this PDF, preserving structure. Render tables as GitHub-flavored markdown tables."
-}
-
 const documentIdOf = (data: Uint8Array): string =>
   createHash("sha256").update(data).digest("hex").slice(0, 16)
 
@@ -76,64 +71,139 @@ const toChunks = (
     metadata: { path: source.path, mimeType: source.mimeType, ...extraMetadata(index) }
   }))
 
-export const ProcessorLive: Layer.Layer<Processor, never, Gemini> = Layer.effect(
-  Processor,
-  Effect.gen(function* () {
-    const gemini = yield* Gemini
+/**
+ * Normalizes every modality to text chunks. Audio/image/video ALWAYS pass
+ * through the Ffmpeg conditioning stage before any model sees bytes:
+ *   audio → ffmpeg (16k mono wav) → Transcriber (whisper)
+ *   video → ffmpeg (key frames + audio track) → Gemini describe + Transcriber
+ *   image → ffmpeg (downscale/strip/jpeg) → Gemini describe
+ *   pdf   → Gemini extract · text → chunked raw (+ summary when long)
+ */
+export const ProcessorLive: Layer.Layer<Processor, never, Gemini | Ffmpeg | Transcriber> =
+  Layer.effect(
+    Processor,
+    Effect.gen(function* () {
+      const gemini = yield* Gemini
+      const ffmpeg = yield* Ffmpeg
+      const transcriber = yield* Transcriber
 
-    return Processor.of({
-      process: (source) =>
-        Effect.gen(function* () {
-          const documentId = documentIdOf(source.data)
+      const describeFrames = (
+        source: IngestSource,
+        frames: ReadonlyArray<Uint8Array>
+      ): Effect.Effect<ReadonlyArray<string>, GeminiError> =>
+        Effect.forEach(
+          frames,
+          (frame, i) =>
+            gemini.describeMedia({
+              mimeType: "image/jpeg",
+              data: frame,
+              prompt: `This is key frame ${i + 1} of ${frames.length} from a video. Describe it factually: subjects, actions, on-screen text, setting.`
+            }),
+          { concurrency: FRAME_CONCURRENCY }
+        )
 
-          switch (source.kind) {
-            case "text": {
-              const text = yield* Effect.try({
-                try: () => new TextDecoder("utf-8", { fatal: true }).decode(source.data),
-                catch: (cause) =>
-                  new ProcessingError({ path: source.path, detail: "file is not valid UTF-8", cause })
-              })
-              const bodyChunks = chunkText(text)
-              if (text.length <= SUMMARY_THRESHOLD) {
-                return toChunks(source, documentId, bodyChunks)
+      return Processor.of({
+        process: (source) =>
+          Effect.gen(function* () {
+            const documentId = documentIdOf(source.data)
+
+            switch (source.kind) {
+              case "text": {
+                const text = yield* Effect.try({
+                  try: () => new TextDecoder("utf-8", { fatal: true }).decode(source.data),
+                  catch: (cause) =>
+                    new ProcessingError({ path: source.path, detail: "file is not valid UTF-8", cause })
+                })
+                const bodyChunks = chunkText(text)
+                if (text.length <= SUMMARY_THRESHOLD) {
+                  return toChunks(source, documentId, bodyChunks)
+                }
+                const summary = yield* gemini.generateText(
+                  `Summarize the following document in one dense paragraph, keeping key names, numbers and conclusions:\n\n${text.slice(0, 8000)}`
+                )
+                return toChunks(source, documentId, [summary, ...bodyChunks], (index) =>
+                  index === 0 ? { summary: "true" } : {}
+                )
               }
-              const summary = yield* gemini.generateText(
-                `Summarize the following document in one dense paragraph, keeping key names, numbers and conclusions:\n\n${text.slice(0, 8000)}`
-              )
-              return toChunks(source, documentId, [summary, ...bodyChunks], (index) =>
-                index === 0 ? { summary: "true" } : {}
-              )
-            }
 
-            case "audio":
-            case "video":
-            case "image":
-            case "pdf": {
-              if (source.data.byteLength > MAX_INLINE_BYTES) {
+              case "audio": {
+                const optimized = yield* ffmpeg.optimizeAudio(source)
+                const transcript = yield* transcriber.transcribe({
+                  path: source.path,
+                  data: optimized.data,
+                  mimeType: optimized.mimeType
+                })
+                return toChunks(source, documentId, chunkText(transcript), () => ({
+                  transcript: "true"
+                }))
+              }
+
+              case "video": {
+                const extracted = yield* ffmpeg.extractVideo(source)
+                const [descriptions, transcript] = yield* Effect.all(
+                  [
+                    describeFrames(source, extracted.frames),
+                    Option.match(extracted.audio, {
+                      onNone: () => Effect.succeed(""),
+                      onSome: (audio) =>
+                        transcriber.transcribe({
+                          path: source.path,
+                          data: audio.data,
+                          mimeType: audio.mimeType
+                        })
+                    })
+                  ],
+                  { concurrency: 2 }
+                )
+                const combined = [
+                  transcript.length > 0 ? `Transcript:\n${transcript}` : "",
+                  "Key frames:",
+                  ...descriptions.map((d, i) => `Frame ${i + 1}: ${d}`)
+                ]
+                  .filter((s) => s.length > 0)
+                  .join("\n\n")
+                return toChunks(source, documentId, chunkText(combined), () => ({
+                  frames: String(extracted.frames.length)
+                }))
+              }
+
+              case "image": {
+                const optimized = yield* ffmpeg.optimizeImage(source)
+                const described = yield* gemini.describeMedia({
+                  mimeType: optimized.mimeType,
+                  data: optimized.data,
+                  prompt: "Describe this image in detail: subjects, text (OCR), layout, colors, context."
+                })
+                return toChunks(source, documentId, chunkText(described))
+              }
+
+              case "pdf": {
+                if (source.data.byteLength > MAX_INLINE_BYTES) {
+                  return yield* Effect.fail(
+                    new ProcessingError({
+                      path: source.path,
+                      detail: `file is ${source.data.byteLength} bytes; inline Gemini requests are limited to ~19 MB — split the file or wait for Files API support`
+                    })
+                  )
+                }
+                const described = yield* gemini.describeMedia({
+                  mimeType: source.mimeType,
+                  data: source.data,
+                  prompt:
+                    "Extract the full text of this PDF, preserving structure. Render tables as GitHub-flavored markdown tables."
+                })
+                return toChunks(source, documentId, chunkText(described))
+              }
+
+              case "mix":
                 return yield* Effect.fail(
                   new ProcessingError({
                     path: source.path,
-                    detail: `file is ${source.data.byteLength} bytes; inline Gemini requests are limited to ~19 MB — split the file or wait for Files API support`
+                    detail: "mix sources are decomposed by the pipeline, not the processor"
                   })
                 )
-              }
-              const described = yield* gemini.describeMedia({
-                mimeType: source.mimeType,
-                data: source.data,
-                prompt: MEDIA_PROMPTS[source.kind]
-              })
-              return toChunks(source, documentId, chunkText(described))
             }
-
-            case "mix":
-              return yield* Effect.fail(
-                new ProcessingError({
-                  path: source.path,
-                  detail: "mix sources are decomposed by the pipeline, not the processor"
-                })
-              )
-          }
-        })
+          })
+      })
     })
-  })
-)
+  )

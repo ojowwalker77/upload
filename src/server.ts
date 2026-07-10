@@ -11,11 +11,16 @@ import {
 } from "./api.js"
 import type { GeminiError, ProcessingError, SearchHit, UnsupportedMediaError, VectorStoreError } from "./domain.js"
 import { ingestData, search } from "./pipeline.js"
+import { Ffmpeg } from "./services/Ffmpeg.js"
+import { FfmpegLive } from "./services/FfmpegLive.js"
 import { Gemini } from "./services/Gemini.js"
 import { GeminiLive } from "./services/GeminiLive.js"
 import { GeminiMock } from "./services/GeminiMock.js"
-import { Processor } from "./services/Processor.js"
 import { ProcessorLive } from "./services/ProcessorLive.js"
+import { Transcriber } from "./services/Transcriber.js"
+import { TranscriberGeminiLive } from "./services/TranscriberGemini.js"
+import { TranscriberOpenAILive } from "./services/TranscriberOpenAI.js"
+import { WhisperCppLive } from "./services/TranscriberWhisperCpp.js"
 import { VectorStore } from "./services/VectorStore.js"
 import { MemoryVectorStoreLive } from "./stores/memory.js"
 import { SqliteVectorStoreLive } from "./stores/sqlite.js"
@@ -109,11 +114,19 @@ export const UploadWorldApiLive = HttpApiBuilder.api(UploadWorldApi).pipe(
 
 // ─── Turn-key wiring ─────────────────────────────────────────────────────────
 
+export type TranscriberKind = "whisper" | "openai" | "gemini"
+
 export interface AppConfig {
   /** Bring your own Gemini implementation (overrides `mock`). */
   readonly gemini?: Layer.Layer<Gemini, unknown, never>
   /** Bring your own vector store (overrides `store`/`db`). */
   readonly vectorStore?: Layer.Layer<VectorStore, unknown, never>
+  /** Bring your own media conditioner (default: real ffmpeg binary). */
+  readonly ffmpeg?: Layer.Layer<Ffmpeg, unknown, never>
+  /** Bring your own speech-to-text (overrides `transcriber`). */
+  readonly transcriberLayer?: Layer.Layer<Transcriber, unknown, never>
+  /** whisper = local whisper.cpp (default) · openai = Whisper API · gemini = Gemini native */
+  readonly transcriber?: TranscriberKind
   readonly store?: "sqlite" | "memory"
   readonly db?: string
   readonly mock?: boolean
@@ -122,19 +135,34 @@ export interface AppConfig {
 /** Everything the handlers need, from a simple config. */
 export const appLayer = (config: AppConfig = {}) => {
   const hasKey = (process.env["GEMINI_API_KEY"] ?? "").trim().length > 0
+  const useMock = config.mock === true || !hasKey
   const gemini =
-    config.gemini ??
-    (config.mock === true || !hasKey
-      ? GeminiMock
-      : GeminiLive.pipe(Layer.provide(NodeHttpClient.layer)))
+    config.gemini ?? (useMock ? GeminiMock : GeminiLive.pipe(Layer.provide(NodeHttpClient.layer)))
   const vectorStore =
     config.vectorStore ??
     (config.store === "memory"
       ? MemoryVectorStoreLive
       : SqliteVectorStoreLive(config.db ?? "./upload-world.db"))
+  // ffmpeg conditioning is mandatory and key-free: always the real binary
+  // unless the embedder explicitly injects something else.
+  const ffmpeg = config.ffmpeg ?? FfmpegLive.pipe(Layer.provide(NodeContext.layer))
+  const transcriber =
+    config.transcriberLayer ??
+    (() => {
+      // keyless/mock runs default to the (mocked) Gemini transcriber so the
+      // demo works with no whisper binary or model download
+      switch (config.transcriber ?? (useMock ? "gemini" : "whisper")) {
+        case "whisper":
+          return WhisperCppLive.pipe(Layer.provide(NodeContext.layer))
+        case "openai":
+          return TranscriberOpenAILive.pipe(Layer.provide(NodeHttpClient.layer))
+        case "gemini":
+          return TranscriberGeminiLive.pipe(Layer.provide(gemini))
+      }
+    })()
   return Layer.mergeAll(
     gemini,
-    ProcessorLive.pipe(Layer.provide(gemini)),
+    ProcessorLive.pipe(Layer.provide(Layer.mergeAll(gemini, ffmpeg, transcriber))),
     vectorStore,
     NodeContext.layer
   )

@@ -5,23 +5,31 @@ and it is normalized to text, embedded with Gemini embeddings, and stored in a
 **pluggable vector store**.
 
 ```
-file ──▶ Router ──▶ Processor (Gemini Flash) ──▶ text chunks ──▶ Gemini embeddings ──▶ VectorStore
-             │                                                                            │
-   text · audio · video · image · pdf                                    memory · sqlite-vec · yours
+                       ┌─ text  ────────────────────────────▶ chunk (+ summary) ─┐
+                       ├─ audio ─▶ ffmpeg (16k mono wav) ───▶ Whisper ───────────┤
+file ──▶ Router ──────▶├─ video ─▶ ffmpeg (key frames+audio)▶ describe + Whisper ├─▶ Gemini Embedding 2 ─▶ VectorStore
+                       ├─ image ─▶ ffmpeg (≤1568px jpeg) ───▶ Gemini describe ───┤        │
+                       └─ pdf  ──────────────────────────────▶ Gemini extract ───┘   memory · sqlite-vec · yours
 ```
 
 Built with **TypeScript 7 (tsgo)** and the **Effect** ecosystem. Library-first:
 every stage is an Effect service behind a `Context.Tag`, wired with Layers — so the
 same core drops into a CLI, an HTTP API, a queue worker, or a cron job on any VM,
-and every stage (model provider, vector store, chunking) is swappable.
+and every stage (transcriber, media conditioning, model provider, vector store) is swappable.
 
 ## Design notes
 
-- **One provider, no ffmpeg/Whisper**: Gemini Flash natively understands audio,
-  video, images and PDFs. The diagram's "Whisper → transcript" and "key frames →
-  describe" collapse into a single `Gemini.describeMedia(mimeType, bytes, prompt)`
-  seam with modality-specific prompts. Want real Whisper or a different provider?
-  Implement the `Gemini` service interface and swap the Layer.
+- **ffmpeg is a mandatory conditioning stage**: every audio/image/video input is
+  optimized *before any model sees bytes* — audio to 16 kHz mono loudness-normalized
+  WAV, images downscaled to ≤1568px stripped JPEG, video split into ≤12
+  scene-detected key frames plus its audio track.
+- **Real Whisper**: audio (and video soundtracks) transcribe through the
+  `Transcriber` seam — local **whisper.cpp** by default (`brew install whisper-cpp`,
+  ggml model auto-downloads on first use), or `--transcriber openai` (Whisper API),
+  or `--transcriber gemini` (no extra binary).
+- **Gemini Embedding 2** (`gemini-embedding-2`): auto-normalized MRL vectors, no
+  taskType param — retrieval intent is prefixed onto queries. Set
+  `UPLOAD_WORLD_EMBEDDING_MODEL=gemini-embedding-001` for the legacy model.
 - **Pluggable storage**: `VectorStore` is a 3-method interface (`upsert`,
   `search`, `count`). Shipped adapters: in-memory and SQLite + sqlite-vec
   (single-file, zero infra). pgvector/LanceDB/SaaS are ~100-line adapters away.
@@ -38,6 +46,7 @@ pnpm dev status
 ```
 
 Options: `--store sqlite|memory` (default `sqlite`), `--db ./upload-world.db`,
+`--transcriber whisper|openai|gemini` (default `whisper` = local whisper.cpp),
 `--mock` (force the offline Gemini layer; also used automatically when
 `GEMINI_API_KEY` is unset).
 
@@ -107,10 +116,10 @@ Layer — nothing else changes.
 ## Setup
 
 ```sh
+brew install ffmpeg whisper-cpp   # media conditioning + local transcription
 pnpm install
 cp .env.example .env   # add GEMINI_API_KEY when you have one
-pnpm typecheck         # TypeScript 7 native (tsgo)
-pnpm test
+pnpm check             # tsgo typecheck + oxlint + vitest
 ```
 
 ## Config (env)
@@ -118,9 +127,14 @@ pnpm test
 | Variable | Default | |
 |---|---|---|
 | `GEMINI_API_KEY` | — | unset ⇒ mock layer |
-| `UPLOAD_WORLD_GEMINI_MODEL` | `gemini-2.5-flash` | describe/transcribe/extract |
-| `UPLOAD_WORLD_EMBEDDING_MODEL` | `gemini-embedding-001` | |
-| `UPLOAD_WORLD_EMBEDDING_DIM` | `768` | MRL-truncated, re-normalized |
+| `OPENAI_API_KEY` | — | only for `--transcriber openai` |
+| `UPLOAD_WORLD_GEMINI_MODEL` | `gemini-2.5-flash` | describe/extract |
+| `UPLOAD_WORLD_EMBEDDING_MODEL` | `gemini-embedding-2` | `…-001` for legacy taskType behavior |
+| `UPLOAD_WORLD_EMBEDDING_DIM` | `768` | 128–3072; 768/1536/3072 recommended |
+| `UPLOAD_WORLD_FFMPEG_BIN` | `ffmpeg` | |
+| `UPLOAD_WORLD_WHISPER_BIN` | `whisper-cli` | from `brew install whisper-cpp` |
+| `UPLOAD_WORLD_WHISPER_MODEL` | `base` | tiny/base/small/medium/large-v3-turbo, auto-downloaded |
+| `UPLOAD_WORLD_WHISPER_MODEL_PATH` | — | explicit ggml file, skips download |
 
 ## Limits (v1)
 

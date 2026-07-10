@@ -7,12 +7,13 @@ import { join } from "node:path"
 import { describe, expect } from "vitest"
 import { ingestPaths, search } from "../src/pipeline.js"
 import { GeminiMock } from "../src/services/GeminiMock.js"
+import { FfmpegMock, TranscriberMock } from "../src/services/mocks.js"
 import { ProcessorLive } from "../src/services/ProcessorLive.js"
 import { MemoryVectorStoreLive } from "../src/stores/memory.js"
 
 const TestLayer = Layer.mergeAll(
   GeminiMock,
-  ProcessorLive.pipe(Layer.provide(GeminiMock)),
+  ProcessorLive.pipe(Layer.provide(Layer.mergeAll(GeminiMock, FfmpegMock, TranscriberMock))),
   MemoryVectorStoreLive,
   NodeContext.layer
 )
