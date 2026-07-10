@@ -1,16 +1,10 @@
 #!/usr/bin/env node
 import { Args, Command, Options } from "@effect/cli"
-import { NodeContext, NodeHttpClient, NodeRuntime } from "@effect/platform-node"
+import { NodeContext, NodeRuntime } from "@effect/platform-node"
 import { Console, Effect, Layer } from "effect"
 import { ingestPaths, search } from "./pipeline.js"
-import { Gemini } from "./services/Gemini.js"
-import { GeminiLive } from "./services/GeminiLive.js"
-import { GeminiMock } from "./services/GeminiMock.js"
-import { Processor } from "./services/Processor.js"
-import { ProcessorLive } from "./services/ProcessorLive.js"
+import { appLayer as makeAppLayer, serverLayer } from "./server.js"
 import { VectorStore } from "./services/VectorStore.js"
-import { MemoryVectorStoreLive } from "./stores/memory.js"
-import { SqliteVectorStoreLive } from "./stores/sqlite.js"
 
 // ─── Shared options ──────────────────────────────────────────────────────────
 
@@ -34,19 +28,13 @@ interface StoreConfig {
   readonly mock: boolean
 }
 
-const appLayer = ({ db, mock, store }: StoreConfig) => {
+const appLayer = (config: StoreConfig) => {
   const hasKey = (process.env["GEMINI_API_KEY"] ?? "").trim().length > 0
-  const useMock = mock || !hasKey
-  const gemini = useMock ? GeminiMock : GeminiLive.pipe(Layer.provide(NodeHttpClient.layer))
-  const vectorStore = store === "memory" ? MemoryVectorStoreLive : SqliteVectorStoreLive(db)
   const note =
-    useMock && !mock
+    !config.mock && !hasKey
       ? Console.error("note: GEMINI_API_KEY is not set — using the deterministic mock Gemini layer")
       : Effect.void
-  return {
-    layer: Layer.mergeAll(gemini, ProcessorLive.pipe(Layer.provide(gemini)), vectorStore),
-    note
-  }
+  return { layer: makeAppLayer(config), note }
 }
 
 // ─── ingest ──────────────────────────────────────────────────────────────────
@@ -130,11 +118,37 @@ const statusCommand = Command.make(
   }
 ).pipe(Command.withDescription("show stored chunk count"))
 
+// ─── serve ───────────────────────────────────────────────────────────────────
+
+const serveCommand = Command.make(
+  "serve",
+  {
+    port: Options.integer("port").pipe(
+      Options.withAlias("p"),
+      Options.withDefault(3000),
+      Options.withDescription("port to listen on")
+    ),
+    store: storeOption,
+    db: dbOption,
+    mock: mockOption
+  },
+  ({ db, mock, port, store }) => {
+    const app = appLayer({ store, db, mock })
+    return Effect.gen(function* () {
+      yield* app.note
+      yield* Console.log(
+        `upload-world API on http://localhost:${port} — OpenAPI docs at http://localhost:${port}/docs`
+      )
+      yield* Layer.launch(serverLayer({ port, store, db, mock }))
+    })
+  }
+).pipe(Command.withDescription("serve the HTTP API (multipart + raw ingest, search, status)"))
+
 // ─── root ────────────────────────────────────────────────────────────────────
 
 const root = Command.make("upload-world").pipe(
   Command.withDescription("multimodal ingest → Gemini embeddings → pluggable vector store"),
-  Command.withSubcommands([ingestCommand, searchCommand, statusCommand])
+  Command.withSubcommands([ingestCommand, searchCommand, statusCommand, serveCommand])
 )
 
 const cli = Command.run(root, { name: "upload-world", version: "0.1.0" })

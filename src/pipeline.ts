@@ -1,7 +1,15 @@
 import { FileSystem } from "@effect/platform"
 import type { PlatformError } from "@effect/platform/Error"
 import { Effect, Either } from "effect"
-import type { EmbeddedChunk, GeminiError, MediaKind, ProcessingError, SearchHit, VectorStoreError } from "./domain.js"
+import type {
+  EmbeddedChunk,
+  GeminiError,
+  MediaKind,
+  ProcessingError,
+  SearchHit,
+  UnsupportedMediaError,
+  VectorStoreError
+} from "./domain.js"
 import { detectMedia } from "./services/Router.js"
 import { Gemini } from "./services/Gemini.js"
 import { Processor } from "./services/Processor.js"
@@ -35,21 +43,23 @@ const embedChunks = (
     return vectors
   })
 
-/** Ingest one file: read → route → normalize to chunks → embed → store. */
-export const ingestPath = (
-  path: string
+/**
+ * Ingest raw bytes under a (file)name — the name only drives modality routing
+ * and provenance metadata, so this works for uploads that never touch disk.
+ */
+export const ingestData = (
+  path: string,
+  data: Uint8Array
 ): Effect.Effect<
   IngestResult,
-  PlatformError | GeminiError | ProcessingError | VectorStoreError | import("./domain.js").UnsupportedMediaError,
-  FileSystem.FileSystem | Gemini | Processor | VectorStore
+  GeminiError | ProcessingError | VectorStoreError | UnsupportedMediaError,
+  Gemini | Processor | VectorStore
 > =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem
     const processor = yield* Processor
     const store = yield* VectorStore
 
     const media = yield* detectMedia(path)
-    const data = yield* fs.readFile(path)
     const chunks = yield* processor.process({ path, data, ...media })
     const vectors = yield* embedChunks(chunks)
     const embedded: Array<EmbeddedChunk> = chunks.map((chunk, i) => ({
@@ -60,6 +70,20 @@ export const ingestPath = (
 
     const documentId = embedded[0]?.documentId ?? "empty"
     return { documentId, path, kind: media.kind, chunks: embedded.length }
+  })
+
+/** Ingest one file from disk: read → route → normalize → embed → store. */
+export const ingestPath = (
+  path: string
+): Effect.Effect<
+  IngestResult,
+  PlatformError | GeminiError | ProcessingError | VectorStoreError | UnsupportedMediaError,
+  FileSystem.FileSystem | Gemini | Processor | VectorStore
+> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const data = yield* fs.readFile(path)
+    return yield* ingestData(path, data)
   })
 
 const collectFiles = (

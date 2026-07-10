@@ -41,6 +41,46 @@ Options: `--store sqlite|memory` (default `sqlite`), `--db ./upload-world.db`,
 `--mock` (force the offline Gemini layer; also used automatically when
 `GEMINI_API_KEY` is unset).
 
+## HTTP API — drop it into anything
+
+Three ways to expose the same typed API (`POST /ingest` multipart · `POST /ingest/raw` bytes · `GET /search` · `GET /status`, OpenAPI docs at `/docs`):
+
+**1. Standalone server**
+
+```sh
+pnpm dev serve --port 3000 --db ./vectors.db
+```
+
+```sh
+# any number of files, any supported type, in one request
+curl -X POST http://localhost:3000/ingest -F files=@talk.mp3 -F files=@scan.pdf -F files=@notes.md
+
+# raw bytes from an app/queue/webhook — no multipart needed
+curl -X POST "http://localhost:3000/ingest/raw?filename=notes.md" \
+  -H "content-type: application/octet-stream" --data-binary @notes.md
+
+curl "http://localhost:3000/search?q=pricing+discussion&k=5"
+curl http://localhost:3000/status
+```
+
+**2. Web-standard handler** — `(Request) => Promise<Response>`, mounts in Express, Hono, Fastify, Next.js, Bun, Deno, a Lambda…
+
+```ts
+import { makeWebHandler } from "upload-world"
+
+const { handler, dispose } = makeWebHandler({ db: "./vectors.db" })
+
+// Hono                                    // Next.js route.ts
+app.all("/rag/*", (c) => handler(c.req.raw))   // export const POST = handler
+
+// Express 5
+app.use("/rag", async (req, res) => { /* convert via Readable.toWeb or use a fetch adapter */ })
+```
+
+**3. Effect Layer** — already running an Effect HTTP server? Merge `UploadWorldApiLive` (needs `Gemini | Processor | VectorStore | FileSystem`) into your existing `HttpApiBuilder.serve()` stack, or compose `serverLayer({ port, ... })` directly.
+
+Error mapping: unsupported type → `415`, unprocessable file → `422`, Gemini failure → `502`, store failure → `500`. Batch `/ingest` never fails the batch — per-file problems come back in `skipped`.
+
 ## Library
 
 ```ts
