@@ -9,8 +9,12 @@ import {
   ApiUpstreamFailed,
   UploadWorldApi
 } from "./api.js"
-import type { GeminiError, ProcessingError, SearchHit, UnsupportedMediaError, VectorStoreError } from "./domain.js"
+import type { EmbedderError, GeminiError, ProcessingError, SearchHit, UnsupportedMediaError, VectorStoreError } from "./domain.js"
 import { ingestData, search } from "./pipeline.js"
+import { Embedder } from "./services/Embedder.js"
+import { EmbedderGeminiLive } from "./services/EmbedderGemini.js"
+import { EmbedderMock } from "./services/EmbedderMock.js"
+import { EmbedderOllamaLive } from "./services/EmbedderOllama.js"
 import { Ffmpeg } from "./services/Ffmpeg.js"
 import { FfmpegLive } from "./services/FfmpegLive.js"
 import { Gemini } from "./services/Gemini.js"
@@ -26,7 +30,7 @@ import { MemoryVectorStoreLive } from "./stores/memory.js"
 import { SqliteVectorStoreLive } from "./stores/sqlite.js"
 
 const toApiError = (
-  e: GeminiError | ProcessingError | VectorStoreError | UnsupportedMediaError
+  e: GeminiError | EmbedderError | ProcessingError | VectorStoreError | UnsupportedMediaError
 ): ApiUnsupportedMedia | ApiProcessingFailed | ApiUpstreamFailed | ApiStoreFailed => {
   switch (e._tag) {
     case "UnsupportedMediaError":
@@ -35,6 +39,8 @@ const toApiError = (
       return new ApiProcessingFailed({ path: e.path, detail: e.detail })
     case "GeminiError":
       return new ApiUpstreamFailed({ detail: `${e.operation}: ${e.detail}` })
+    case "EmbedderError":
+      return new ApiUpstreamFailed({ detail: `embed(${e.model}): ${e.detail}` })
     case "VectorStoreError":
       return new ApiStoreFailed({ detail: `${e.operation}: ${e.detail}` })
   }
@@ -90,8 +96,8 @@ export const PipelineHandlersLive = HttpApiBuilder.group(UploadWorldApi, "pipeli
       search(urlParams.q, urlParams.k).pipe(
         Effect.map((hits) => hits.map(toWireHit)),
         Effect.mapError((e) =>
-          e._tag === "GeminiError"
-            ? new ApiUpstreamFailed({ detail: `${e.operation}: ${e.detail}` })
+          e._tag === "EmbedderError"
+            ? new ApiUpstreamFailed({ detail: `embed(${e.model}): ${e.detail}` })
             : new ApiStoreFailed({ detail: `${e.operation}: ${e.detail}` })
         )
       )
@@ -115,6 +121,7 @@ export const UploadWorldApiLive = HttpApiBuilder.api(UploadWorldApi).pipe(
 // ─── Turn-key wiring ─────────────────────────────────────────────────────────
 
 export type TranscriberKind = "whisper" | "openai" | "gemini"
+export type EmbedderKind = "gemini" | "ollama" | "mock"
 
 export interface AppConfig {
   /** Bring your own Gemini implementation (overrides `mock`). */
@@ -127,6 +134,10 @@ export interface AppConfig {
   readonly transcriberLayer?: Layer.Layer<Transcriber, unknown, never>
   /** whisper = local whisper.cpp (default) · openai = Whisper API · gemini = Gemini native */
   readonly transcriber?: TranscriberKind
+  /** Bring your own embedder (overrides `embedder`). */
+  readonly embedderLayer?: Layer.Layer<Embedder, unknown, never>
+  /** gemini = Embedding 2 API · ollama = local EmbeddingGemma ($0, offline) · mock */
+  readonly embedder?: EmbedderKind
   readonly store?: "sqlite" | "memory"
   readonly db?: string
   readonly mock?: boolean
@@ -160,8 +171,21 @@ export const appLayer = (config: AppConfig = {}) => {
           return TranscriberGeminiLive.pipe(Layer.provide(gemini))
       }
     })()
+  const embedder =
+    config.embedderLayer ??
+    (() => {
+      switch (config.embedder ?? (useMock ? "mock" : "gemini")) {
+        case "gemini":
+          return EmbedderGeminiLive.pipe(Layer.provide(NodeHttpClient.layer))
+        case "ollama":
+          return EmbedderOllamaLive.pipe(Layer.provide(NodeHttpClient.layer))
+        case "mock":
+          return EmbedderMock
+      }
+    })()
   return Layer.mergeAll(
     gemini,
+    embedder,
     ProcessorLive.pipe(Layer.provide(Layer.mergeAll(gemini, ffmpeg, transcriber))),
     vectorStore,
     NodeContext.layer

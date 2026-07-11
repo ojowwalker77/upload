@@ -30,7 +30,7 @@ Degradation is *graceful and loud*: the component always says what it resolved t
 | **Transcribe** | whisper.cpp/Metal · faster-whisper int8 (CPU srv) · OpenAI API · Gemini | ✅ 3 of 4 · syncEngine adapter planned |
 | **Describe** (vision) | Gemini Flash · gemma3:4b (Ollama) · moondream2 · *skip+warn* | ✅ Gemini · local planned |
 | **Extract** (PDF) | Gemini · pdftotext + vision fallback | ✅ Gemini · pdftotext planned |
-| **Embed** | gemini-embedding-2 · EmbeddingGemma-300m local (768 MRL) · mock | ✅ Gemini+mock · local planned |
+| **Embed** | gemini-embedding-2 · EmbeddingGemma-300m local via Ollama (768 MRL) · mock | ✅ all three |
 | **Store** | sqlite-vec · memory · pgvector · libSQL/Turso · Qdrant | ✅ 2 of 5 |
 
 Rules:
@@ -106,7 +106,7 @@ GET /capabilities
 
 ## 7. Build order
 
-1. **Local embeddings** (EmbeddingGemma via Ollama or node-llama-cpp) — unlocks T0–T3.
+1. ~~**Local embeddings** (EmbeddingGemma via Ollama) — unlocks T0–T3.~~ ✅ shipped, incl. the vector-space guard.
 2. **Timed transcripts** (whisper.cpp `-oj` + syncEngine-style boundary scoring) — time-anchored chunks.
 3. **`/capabilities` + resolver** — the auto-tier probe.
 4. **pdftotext extract rung** — free PDFs.

@@ -1,17 +1,18 @@
 import { FileSystem } from "@effect/platform"
 import type { PlatformError } from "@effect/platform/Error"
-import { Effect, Either } from "effect"
+import { Effect, Either, Option } from "effect"
+import { VectorStoreError } from "./domain.js"
 import type {
   EmbeddedChunk,
+  EmbedderError,
   GeminiError,
   MediaKind,
   ProcessingError,
   SearchHit,
-  UnsupportedMediaError,
-  VectorStoreError
+  UnsupportedMediaError
 } from "./domain.js"
 import { detectMedia } from "./services/Router.js"
-import { Gemini } from "./services/Gemini.js"
+import { Embedder } from "./services/Embedder.js"
 import { Processor } from "./services/Processor.js"
 import { VectorStore } from "./services/VectorStore.js"
 
@@ -27,22 +28,6 @@ export interface IngestReport {
   readonly skipped: ReadonlyArray<{ readonly path: string; readonly reason: string }>
 }
 
-const EMBED_BATCH = 100
-
-const embedChunks = (
-  chunks: ReadonlyArray<{ readonly text: string }>
-): Effect.Effect<ReadonlyArray<ReadonlyArray<number>>, GeminiError, Gemini> =>
-  Effect.gen(function* () {
-    const gemini = yield* Gemini
-    const vectors: Array<ReadonlyArray<number>> = []
-    for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-      const batch = chunks.slice(i, i + EMBED_BATCH)
-      const embedded = yield* gemini.embed(batch.map((c) => c.text), "RETRIEVAL_DOCUMENT")
-      vectors.push(...embedded)
-    }
-    return vectors
-  })
-
 /**
  * Ingest raw bytes under a (file)name — the name only drives modality routing
  * and provenance metadata, so this works for uploads that never touch disk.
@@ -52,18 +37,20 @@ export const ingestData = (
   data: Uint8Array
 ): Effect.Effect<
   IngestResult,
-  GeminiError | ProcessingError | VectorStoreError | UnsupportedMediaError,
-  Gemini | Processor | VectorStore
+  GeminiError | EmbedderError | ProcessingError | VectorStoreError | UnsupportedMediaError,
+  Embedder | Processor | VectorStore
 > =>
   Effect.gen(function* () {
     const processor = yield* Processor
+    const embedder = yield* Embedder
     const store = yield* VectorStore
 
     const media = yield* detectMedia(path)
     const chunks = yield* processor.process({ path, data, ...media })
-    const vectors = yield* embedChunks(chunks)
+    const vectors = yield* embedder.embed(chunks.map((c) => c.text), "document")
     const embedded: Array<EmbeddedChunk> = chunks.map((chunk, i) => ({
       ...chunk,
+      metadata: { ...chunk.metadata, embeddingModel: embedder.info.model },
       embedding: vectors[i] ?? []
     }))
     yield* store.upsert(embedded)
@@ -77,8 +64,8 @@ export const ingestPath = (
   path: string
 ): Effect.Effect<
   IngestResult,
-  PlatformError | GeminiError | ProcessingError | VectorStoreError | UnsupportedMediaError,
-  FileSystem.FileSystem | Gemini | Processor | VectorStore
+  PlatformError | GeminiError | EmbedderError | ProcessingError | VectorStoreError | UnsupportedMediaError,
+  FileSystem.FileSystem | Embedder | Processor | VectorStore
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
@@ -119,7 +106,7 @@ export const ingestPaths = (
 ): Effect.Effect<
   IngestReport,
   PlatformError,
-  FileSystem.FileSystem | Gemini | Processor | VectorStore
+  FileSystem.FileSystem | Embedder | Processor | VectorStore
 > =>
   Effect.gen(function* () {
     const candidates: Array<string> = []
@@ -161,10 +148,27 @@ export const ingestPaths = (
 export const search = (
   query: string,
   k: number
-): Effect.Effect<ReadonlyArray<SearchHit>, GeminiError | VectorStoreError, Gemini | VectorStore> =>
+): Effect.Effect<
+  ReadonlyArray<SearchHit>,
+  EmbedderError | VectorStoreError,
+  Embedder | VectorStore
+> =>
   Effect.gen(function* () {
-    const gemini = yield* Gemini
+    const embedder = yield* Embedder
     const store = yield* VectorStore
-    const vectors = yield* gemini.embed([query], "RETRIEVAL_QUERY")
+
+    // refuse to search across vector spaces — same dims, different model
+    // would silently return garbage neighbors
+    const meta = yield* store.meta
+    if (Option.isSome(meta) && meta.value.model !== embedder.info.model) {
+      return yield* Effect.fail(
+        new VectorStoreError({
+          operation: "search",
+          detail: `store was embedded with "${meta.value.model}" but the current embedder is "${embedder.info.model}" — re-ingest, or switch back with --embedder`
+        })
+      )
+    }
+
+    const vectors = yield* embedder.embed([query], "query")
     return yield* store.search(vectors[0] ?? [], k)
   })

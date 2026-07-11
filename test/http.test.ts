@@ -8,7 +8,8 @@ const { dispose, handler } = makeWebHandler({
   gemini: GeminiMock,
   vectorStore: MemoryVectorStoreLive,
   ffmpeg: FfmpegMock,
-  transcriberLayer: TranscriberMock
+  transcriberLayer: TranscriberMock,
+  embedder: "mock"
 })
 
 afterAll(() => dispose())

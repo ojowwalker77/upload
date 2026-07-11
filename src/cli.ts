@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Args, Command, Options } from "@effect/cli"
 import { NodeContext, NodeRuntime } from "@effect/platform-node"
-import { Console, Effect, Layer } from "effect"
+import { Console, Effect, Layer, Option } from "effect"
 import { ingestPaths, search } from "./pipeline.js"
 import { appLayer as makeAppLayer, serverLayer } from "./server.js"
 import { VectorStore } from "./services/VectorStore.js"
@@ -27,11 +27,17 @@ const transcriberOption = Options.choice("transcriber", ["whisper", "openai", "g
   Options.withDescription("speech-to-text backend for audio/video")
 )
 
+const embedderOption = Options.choice("embedder", ["gemini", "ollama", "mock"]).pipe(
+  Options.optional,
+  Options.withDescription("embedding backend (default: gemini with key, mock without; ollama = 100% local)")
+)
+
 interface StoreConfig {
   readonly store: "sqlite" | "memory"
   readonly db: string
   readonly mock: boolean
   readonly transcriber?: "whisper" | "openai" | "gemini"
+  readonly embedder?: "gemini" | "ollama" | "mock"
 }
 
 const appLayer = (config: StoreConfig) => {
@@ -55,10 +61,17 @@ const ingestCommand = Command.make(
     store: storeOption,
     db: dbOption,
     mock: mockOption,
-    transcriber: transcriberOption
+    transcriber: transcriberOption,
+    embedder: embedderOption
   },
-  ({ db, mock, paths, store, transcriber }) => {
-    const app = appLayer({ store, db, mock, transcriber })
+  ({ db, embedder, mock, paths, store, transcriber }) => {
+    const app = appLayer({
+      store,
+      db,
+      mock,
+      transcriber,
+      ...(Option.isSome(embedder) ? { embedder: embedder.value } : {})
+    })
     return Effect.gen(function* () {
       yield* app.note
       const report = yield* ingestPaths(paths)
@@ -89,10 +102,16 @@ const searchCommand = Command.make(
     ),
     store: storeOption,
     db: dbOption,
-    mock: mockOption
+    mock: mockOption,
+    embedder: embedderOption
   },
-  ({ db, k, mock, query, store }) => {
-    const app = appLayer({ store, db, mock })
+  ({ db, embedder, k, mock, query, store }) => {
+    const app = appLayer({
+      store,
+      db,
+      mock,
+      ...(Option.isSome(embedder) ? { embedder: embedder.value } : {})
+    })
     return Effect.gen(function* () {
       yield* app.note
       const hits = yield* search(query, k)
@@ -138,16 +157,24 @@ const serveCommand = Command.make(
     store: storeOption,
     db: dbOption,
     mock: mockOption,
-    transcriber: transcriberOption
+    transcriber: transcriberOption,
+    embedder: embedderOption
   },
-  ({ db, mock, port, store, transcriber }) => {
-    const app = appLayer({ store, db, mock, transcriber })
+  ({ db, embedder, mock, port, store, transcriber }) => {
+    const config = {
+      store,
+      db,
+      mock,
+      transcriber,
+      ...(Option.isSome(embedder) ? { embedder: embedder.value } : {})
+    }
+    const app = appLayer(config)
     return Effect.gen(function* () {
       yield* app.note
       yield* Console.log(
         `upload-world API on http://localhost:${port} — OpenAPI docs at http://localhost:${port}/docs`
       )
-      yield* Layer.launch(serverLayer({ port, store, db, mock, transcriber }))
+      yield* Layer.launch(serverLayer({ port, ...config }))
     })
   }
 ).pipe(Command.withDescription("serve the HTTP API (multipart + raw ingest, search, status)"))

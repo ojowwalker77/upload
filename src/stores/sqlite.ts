@@ -1,11 +1,13 @@
 import Database from "better-sqlite3"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import * as sqliteVec from "sqlite-vec"
 import { VectorStoreError } from "../domain.js"
 import type { EmbeddedChunk, MediaKind, SearchHit } from "../domain.js"
 import { VectorStore } from "../services/VectorStore.js"
+import type { StoreMeta } from "../services/VectorStore.js"
+import { metaOfChunk } from "./memory.js"
 
 interface ChunkRow {
   readonly id: string
@@ -69,6 +71,13 @@ export const SqliteVectorStoreLive = (
         return row === undefined ? undefined : Number(row.value)
       }
 
+      const modelOf = (): string | undefined => {
+        const row = db
+          .prepare("SELECT value FROM meta WHERE key = 'model'")
+          .get() as { value: string } | undefined
+        return row?.value
+      }
+
       const isInitialized = (): boolean => {
         const row = db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
@@ -119,10 +128,25 @@ export const SqliteVectorStoreLive = (
             : Effect.gen(function* () {
                 const first = chunks[0]
                 if (first === undefined) return
+                const incoming = metaOfChunk(first)
                 yield* tryStore("upsert", "failed to initialize schema", () => {
                   if (!isInitialized()) initialize(first.embedding.length)
                 })
                 yield* checkDim("upsert", first.embedding.length)
+                const existingModel = yield* tryStore("upsert", "failed to read store meta", modelOf)
+                if (existingModel !== undefined && existingModel !== incoming.model) {
+                  return yield* Effect.fail(
+                    new VectorStoreError({
+                      operation: "upsert",
+                      detail: `store was embedded with "${existingModel}", incoming chunks use "${incoming.model}" — re-ingest or switch embedder`
+                    })
+                  )
+                }
+                yield* tryStore("upsert", "failed to record embedding model", () => {
+                  db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)").run(
+                    incoming.model
+                  )
+                })
                 yield* tryStore("upsert", `failed to upsert ${chunks.length} chunks`, () => {
                   const deleteChunk = db.prepare("DELETE FROM chunks WHERE id = ?")
                   const deleteVec = db.prepare("DELETE FROM chunks_vec WHERE id = ?")
@@ -185,6 +209,18 @@ export const SqliteVectorStoreLive = (
           return yield* tryStore("search", "count failed", () => {
             const row = db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }
             return row.n
+          })
+        }),
+
+        meta: Effect.gen(function* () {
+          const ready = yield* tryStore("search", "failed to inspect schema", isInitialized)
+          if (!ready) return Option.none<StoreMeta>()
+          return yield* tryStore("search", "meta read failed", () => {
+            const model = modelOf()
+            const dim = dimOf()
+            return model !== undefined && dim !== undefined
+              ? Option.some<StoreMeta>({ model, dim })
+              : Option.none<StoreMeta>()
           })
         })
       })

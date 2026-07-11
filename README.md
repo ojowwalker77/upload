@@ -27,9 +27,16 @@ and every stage (transcriber, media conditioning, model provider, vector store) 
   `Transcriber` seam — local **whisper.cpp** by default (`brew install whisper-cpp`,
   ggml model auto-downloads on first use), or `--transcriber openai` (Whisper API),
   or `--transcriber gemini` (no extra binary).
-- **Gemini Embedding 2** (`gemini-embedding-2`): auto-normalized MRL vectors, no
-  taskType param — retrieval intent is prefixed onto queries. Set
-  `UPLOAD_WORLD_EMBEDDING_MODEL=gemini-embedding-001` for the legacy model.
+- **Embeddings are their own seam** with three rungs: `--embedder gemini`
+  (Gemini Embedding 2: auto-normalized MRL, query intent as prompt prefix),
+  `--embedder ollama` (**100% local, $0**: EmbeddingGemma-300m via Ollama —
+  `brew install ollama && ollama pull embeddinggemma`), or `mock`.
+  Stores record their embedding model and **refuse cross-model searches** —
+  same-dim vectors from different models would be silent garbage.
+- **Budget mode, fully offline**:
+  `upload-world ingest ./media --embedder ollama --transcriber whisper` —
+  ffmpeg + whisper.cpp + EmbeddingGemma + sqlite-vec, no keys, no bytes leave
+  the machine.
 - **Pluggable storage**: `VectorStore` is a 3-method interface (`upsert`,
   `search`, `count`). Shipped adapters: in-memory and SQLite + sqlite-vec
   (single-file, zero infra). pgvector/LanceDB/SaaS are ~100-line adapters away.
@@ -47,8 +54,9 @@ pnpm dev status
 
 Options: `--store sqlite|memory` (default `sqlite`), `--db ./upload-world.db`,
 `--transcriber whisper|openai|gemini` (default `whisper` = local whisper.cpp),
-`--mock` (force the offline Gemini layer; also used automatically when
-`GEMINI_API_KEY` is unset).
+`--embedder gemini|ollama|mock` (default: `gemini` with a key, `mock` without;
+`ollama` = local EmbeddingGemma), `--mock` (force the offline Gemini layer;
+also used automatically when `GEMINI_API_KEY` is unset).
 
 ## HTTP API — drop it into anything
 

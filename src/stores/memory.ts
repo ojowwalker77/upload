@@ -1,6 +1,8 @@
-import { Effect, Layer, Ref } from "effect"
+import { Effect, Layer, Option, Ref } from "effect"
+import { VectorStoreError } from "../domain.js"
 import type { EmbeddedChunk, SearchHit } from "../domain.js"
 import { VectorStore } from "../services/VectorStore.js"
+import type { StoreMeta } from "../services/VectorStore.js"
 
 const cosine = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): number => {
   const n = Math.min(a.length, b.length)
@@ -18,18 +20,40 @@ const cosine = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): number => {
   return denominator === 0 ? 0 : dot / denominator
 }
 
+/** The pipeline stamps this on every chunk it embeds. */
+export const metaOfChunk = (chunk: EmbeddedChunk): StoreMeta => ({
+  model: chunk.metadata["embeddingModel"] ?? "unknown",
+  dim: chunk.embedding.length
+})
+
 /** In-memory store — per-process, mainly for tests and library embedding. */
 export const MemoryVectorStoreLive: Layer.Layer<VectorStore> = Layer.effect(
   VectorStore,
   Effect.gen(function* () {
     const ref = yield* Ref.make(new Map<string, EmbeddedChunk>())
+    const metaRef = yield* Ref.make(Option.none<StoreMeta>())
 
     return VectorStore.of({
       upsert: (chunks) =>
-        Ref.update(ref, (map) => {
-          const next = new Map(map)
-          for (const chunk of chunks) next.set(chunk.id, chunk)
-          return next
+        Effect.gen(function* () {
+          const first = chunks[0]
+          if (first === undefined) return
+          const incoming = metaOfChunk(first)
+          const existing = yield* Ref.get(metaRef)
+          if (Option.isSome(existing) && existing.value.model !== incoming.model) {
+            return yield* Effect.fail(
+              new VectorStoreError({
+                operation: "upsert",
+                detail: `store was embedded with "${existing.value.model}", incoming chunks use "${incoming.model}" — re-ingest or switch embedder`
+              })
+            )
+          }
+          yield* Ref.set(metaRef, Option.some(incoming))
+          yield* Ref.update(ref, (map) => {
+            const next = new Map(map)
+            for (const chunk of chunks) next.set(chunk.id, chunk)
+            return next
+          })
         }),
 
       search: (embedding, k) =>
@@ -44,7 +68,9 @@ export const MemoryVectorStoreLive: Layer.Layer<VectorStore> = Layer.effect(
           })
         ),
 
-      count: Ref.get(ref).pipe(Effect.map((map) => map.size))
+      count: Ref.get(ref).pipe(Effect.map((map) => map.size)),
+
+      meta: Ref.get(metaRef)
     })
   })
 )

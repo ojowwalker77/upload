@@ -44,22 +44,48 @@ export interface SearchHit {
 export class UnsupportedMediaError extends Data.TaggedError("UnsupportedMediaError")<{
   readonly path: string
   readonly detail: string
-}> {}
+}> {
+  override get message(): string {
+    return `${this.path}: ${this.detail}`
+  }
+}
 
 export class GeminiError extends Data.TaggedError("GeminiError")<{
   readonly operation: "generate" | "describeMedia" | "embed"
   readonly detail: string
   readonly cause?: unknown
-}> {}
+}> {
+  override get message(): string {
+    return `gemini ${this.operation}: ${this.detail}`
+  }
+}
+
+export class EmbedderError extends Data.TaggedError("EmbedderError")<{
+  readonly model: string
+  readonly detail: string
+  readonly cause?: unknown
+}> {
+  override get message(): string {
+    return `embed(${this.model}): ${this.detail}`
+  }
+}
 
 export class ProcessingError extends Data.TaggedError("ProcessingError")<{
   readonly path: string
   readonly detail: string
   readonly cause?: unknown
-}> {}
+}> {
+  override get message(): string {
+    return `${this.path}: ${this.detail}`
+  }
+}
 
 export class VectorStoreError extends Data.TaggedError("VectorStoreError")<{
   readonly operation: "upsert" | "search" | "init"
   readonly detail: string
   readonly cause?: unknown
-}> {}
+}> {
+  override get message(): string {
+    return `store ${this.operation}: ${this.detail}`
+  }
+}
