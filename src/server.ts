@@ -11,6 +11,7 @@ import {
 } from "./api.js"
 import type { EmbedderError, GeminiError, ProcessingError, SearchHit, UnsupportedMediaError, VectorStoreError } from "./domain.js"
 import { ingestData, search } from "./pipeline.js"
+import type { IngestResult } from "./pipeline.js"
 import { Embedder } from "./services/Embedder.js"
 import { EmbedderGeminiLive } from "./services/EmbedderGemini.js"
 import { EmbedderMock } from "./services/EmbedderMock.js"
@@ -63,22 +64,19 @@ const toWireHit = (hit: SearchHit) => ({
  */
 export const PipelineHandlersLive = HttpApiBuilder.group(UploadWorldApi, "pipeline", (handlers) =>
   handlers
-    .handle("ingest", ({ payload }) =>
+    .handle("ingest", ({ payload, urlParams }) =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
-        const results: Array<{
-          documentId: string
-          path: string
-          kind: "text" | "audio" | "video" | "image" | "pdf" | "mix"
-          chunks: number
-        }> = []
+        const results: Array<IngestResult> = []
         const skipped: Array<{ path: string; reason: string }> = []
 
         for (const file of payload.files) {
           const outcome = yield* fs.readFile(file.path).pipe(
             Effect.mapError((e) => `failed to read upload: ${String(e)}`),
             Effect.flatMap((data) =>
-              ingestData(file.name, data).pipe(Effect.mapError((e) => e.detail))
+              ingestData(file.name, data, {
+                ...(urlParams.corpus === undefined ? {} : { corpusId: urlParams.corpus })
+              }).pipe(Effect.mapError((e) => e.detail))
             ),
             Effect.either
           )
@@ -90,10 +88,21 @@ export const PipelineHandlersLive = HttpApiBuilder.group(UploadWorldApi, "pipeli
       })
     )
     .handle("ingestRaw", ({ payload, urlParams }) =>
-      ingestData(urlParams.filename, payload).pipe(Effect.mapError(toApiError))
+      ingestData(urlParams.filename, payload, {
+        ...(urlParams.corpus === undefined ? {} : { corpusId: urlParams.corpus }),
+        ...(urlParams.sourceType === undefined ? {} : { sourceType: urlParams.sourceType }),
+        ...(urlParams.sourceId === undefined ? {} : { sourceId: urlParams.sourceId }),
+        ...(urlParams.title === undefined ? {} : { title: urlParams.title }),
+        ...(urlParams.sourceUrl === undefined ? {} : { sourceUrl: urlParams.sourceUrl })
+      }).pipe(Effect.mapError(toApiError))
     )
     .handle("search", ({ urlParams }) =>
-      search(urlParams.q, urlParams.k).pipe(
+      search(urlParams.q, urlParams.k, {
+        ...(urlParams.corpus === undefined ? {} : { corpusId: urlParams.corpus }),
+        ...(urlParams.documentIds === undefined
+          ? {}
+          : { documentIds: urlParams.documentIds.split(",").map((id) => id.trim()).filter(Boolean) })
+      }).pipe(
         Effect.map((hits) => hits.map(toWireHit)),
         Effect.mapError((e) =>
           e._tag === "EmbedderError"
@@ -102,11 +111,30 @@ export const PipelineHandlersLive = HttpApiBuilder.group(UploadWorldApi, "pipeli
         )
       )
     )
-    .handle("status", () =>
+    .handle("status", ({ urlParams }) =>
       Effect.gen(function* () {
         const store = yield* VectorStore
-        const chunks = yield* store.count
+        const chunks = yield* store.count(
+          urlParams.corpus === undefined ? undefined : { corpusId: urlParams.corpus }
+        )
         return { chunks }
+      }).pipe(
+        Effect.mapError((e) => new ApiStoreFailed({ detail: `${e.operation}: ${e.detail}` }))
+      )
+    )
+    .handle("documents", ({ urlParams }) =>
+      Effect.gen(function* () {
+        const store = yield* VectorStore
+        return yield* store.listDocuments(urlParams.corpus ?? "default")
+      }).pipe(
+        Effect.mapError((e) => new ApiStoreFailed({ detail: `${e.operation}: ${e.detail}` }))
+      )
+    )
+    .handle("deleteDocument", ({ path }) =>
+      Effect.gen(function* () {
+        const store = yield* VectorStore
+        const deleted = yield* store.deleteDocument(path.documentId)
+        return { documentId: path.documentId, deleted }
       }).pipe(
         Effect.mapError((e) => new ApiStoreFailed({ detail: `${e.operation}: ${e.detail}` }))
       )

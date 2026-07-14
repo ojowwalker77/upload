@@ -1,14 +1,19 @@
 import { FileSystem } from "@effect/platform"
 import type { PlatformError } from "@effect/platform/Error"
 import { Effect, Either, Option } from "effect"
-import { VectorStoreError } from "./domain.js"
+import { createHash } from "node:crypto"
+import { basename } from "node:path"
+import { DEFAULT_CORPUS_ID, EmbedderError, VectorStoreError } from "./domain.js"
 import type {
+  DocumentDescriptor,
+  DocumentMetadata,
   EmbeddedChunk,
-  EmbedderError,
   GeminiError,
   MediaKind,
   ProcessingError,
+  SearchFilter,
   SearchHit,
+  StoredDocument,
   UnsupportedMediaError
 } from "./domain.js"
 import { detectMedia } from "./services/Router.js"
@@ -18,9 +23,13 @@ import { VectorStore } from "./services/VectorStore.js"
 
 export interface IngestResult {
   readonly documentId: string
+  readonly corpusId: string
+  readonly sourceType: string
+  readonly sourceId: string
   readonly path: string
   readonly kind: MediaKind
   readonly chunks: number
+  readonly status: "inserted" | "updated" | "unchanged"
 }
 
 export interface IngestReport {
@@ -28,13 +37,59 @@ export interface IngestReport {
   readonly skipped: ReadonlyArray<{ readonly path: string; readonly reason: string }>
 }
 
+export interface IngestOptions {
+  readonly corpusId?: string
+  readonly sourceType?: string
+  readonly sourceId?: string
+  readonly title?: string
+  readonly sourceUrl?: string | null
+  readonly metadata?: DocumentMetadata
+}
+
+/** Stable across content updates; scoped by corpus and external source identity. */
+export const documentIdFor = (corpusId: string, sourceType: string, sourceId: string): string =>
+  createHash("sha256")
+    .update(JSON.stringify([corpusId, sourceType, sourceId]))
+    .digest("hex")
+    .slice(0, 24)
+
+const contentHashOf = (
+  texts: ReadonlyArray<string>,
+  embeddingModel: string
+): string => {
+  const hash = createHash("sha256")
+  hash.update(embeddingModel)
+  for (const text of texts) {
+    hash.update("\u0000")
+    hash.update(text)
+  }
+  return hash.digest("hex")
+}
+
+const canonicalJson = (value: unknown): string => {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize)
+    if (typeof input !== "object" || input === null) return input
+    return Object.fromEntries(
+      Object.entries(input)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, canonicalize(nested)])
+    )
+  }
+  return JSON.stringify(canonicalize(value))
+}
+
+const metadataMatches = (left: DocumentMetadata, right: DocumentMetadata): boolean =>
+  canonicalJson(left) === canonicalJson(right)
+
 /**
  * Ingest raw bytes under a (file)name — the name only drives modality routing
  * and provenance metadata, so this works for uploads that never touch disk.
  */
 export const ingestData = (
   path: string,
-  data: Uint8Array
+  data: Uint8Array,
+  options: IngestOptions = {}
 ): Effect.Effect<
   IngestResult,
   GeminiError | EmbedderError | ProcessingError | VectorStoreError | UnsupportedMediaError,
@@ -47,21 +102,89 @@ export const ingestData = (
 
     const media = yield* detectMedia(path)
     const chunks = yield* processor.process({ path, data, ...media })
+    const corpusId = options.corpusId ?? DEFAULT_CORPUS_ID
+    const sourceType = options.sourceType ?? "file"
+    const sourceId = options.sourceId ?? path
+    const documentId = documentIdFor(corpusId, sourceType, sourceId)
+    const descriptor: DocumentDescriptor = {
+      id: documentId,
+      corpusId,
+      sourceType,
+      sourceId,
+      sourcePath: path,
+      kind: media.kind,
+      title: (options.title ?? basename(path)) || path,
+      sourceUrl: options.sourceUrl ?? null,
+      contentHash: contentHashOf(chunks.map((chunk) => chunk.text), embedder.info.model),
+      embeddingModel: embedder.info.model,
+      embeddingDim: embedder.info.dim,
+      metadata: options.metadata ?? {}
+    }
+
+    const existing = yield* store.getDocument(documentId)
+    if (
+      Option.isSome(existing) &&
+      existing.value.contentHash === descriptor.contentHash &&
+      existing.value.sourcePath === descriptor.sourcePath &&
+      existing.value.title === descriptor.title &&
+      existing.value.sourceUrl === descriptor.sourceUrl &&
+      metadataMatches(existing.value.metadata, descriptor.metadata)
+    ) {
+      return {
+        documentId,
+        corpusId,
+        sourceType,
+        sourceId,
+        path,
+        kind: media.kind,
+        chunks: existing.value.chunkCount,
+        status: "unchanged" as const
+      }
+    }
+
     const vectors = yield* embedder.embed(chunks.map((c) => c.text), "document")
+    if (vectors.length !== chunks.length) {
+      return yield* Effect.fail(
+        new EmbedderError({
+          model: embedder.info.model,
+          detail: `expected ${chunks.length} embeddings, got ${vectors.length}`
+        })
+      )
+    }
     const embedded: Array<EmbeddedChunk> = chunks.map((chunk, i) => ({
       ...chunk,
-      metadata: { ...chunk.metadata, embeddingModel: embedder.info.model },
+      id: `${documentId}:${chunk.index}`,
+      documentId,
+      metadata: {
+        ...chunk.metadata,
+        corpusId,
+        sourceType,
+        sourceId,
+        title: descriptor.title,
+        ...(descriptor.sourceUrl === null ? {} : { sourceUrl: descriptor.sourceUrl }),
+        contentHash: descriptor.contentHash,
+        embeddingModel: embedder.info.model
+      },
       embedding: vectors[i] ?? []
     }))
-    yield* store.upsert(embedded)
+    const status = yield* store.replaceDocument(descriptor, embedded)
 
-    const documentId = embedded[0]?.documentId ?? "empty"
-    return { documentId, path, kind: media.kind, chunks: embedded.length }
+    return {
+      documentId,
+      corpusId,
+      sourceType,
+      sourceId,
+      path,
+      kind: media.kind,
+      chunks: embedded.length,
+      status
+    }
   })
 
 /** Ingest one file from disk: read → route → normalize → embed → store. */
 export const ingestPath = (
-  path: string
+  path: string,
+  options: IngestOptions = {}
 ): Effect.Effect<
   IngestResult,
   PlatformError | GeminiError | EmbedderError | ProcessingError | VectorStoreError | UnsupportedMediaError,
@@ -70,7 +193,7 @@ export const ingestPath = (
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const data = yield* fs.readFile(path)
-    return yield* ingestData(path, data)
+    return yield* ingestData(path, data, options)
   })
 
 const collectFiles = (
@@ -102,7 +225,8 @@ const collectFiles = (
  * are reported in `skipped` rather than failing the batch.
  */
 export const ingestPaths = (
-  paths: ReadonlyArray<string>
+  paths: ReadonlyArray<string>,
+  options: IngestOptions = {}
 ): Effect.Effect<
   IngestReport,
   PlatformError,
@@ -130,7 +254,16 @@ export const ingestPaths = (
 
     const outcomes = yield* Effect.forEach(
       supported,
-      (file) => ingestPath(file).pipe(Effect.either),
+      (file) =>
+        ingestPath(file, {
+          ...options,
+          sourceId: options.sourceId === undefined || supported.length === 1
+            ? options.sourceId ?? file
+            : `${options.sourceId}:${file}`,
+          ...(options.title !== undefined && supported.length === 1
+            ? { title: options.title }
+            : { title: basename(file) || file })
+        }).pipe(Effect.either),
       { concurrency: 4 }
     )
 
@@ -147,7 +280,8 @@ export const ingestPaths = (
 /** Embed the query and return the k nearest chunks. */
 export const search = (
   query: string,
-  k: number
+  k: number,
+  filter?: SearchFilter
 ): Effect.Effect<
   ReadonlyArray<SearchHit>,
   EmbedderError | VectorStoreError,
@@ -170,5 +304,23 @@ export const search = (
     }
 
     const vectors = yield* embedder.embed([query], "query")
-    return yield* store.search(vectors[0] ?? [], k)
+    return yield* store.search(vectors[0] ?? [], k, filter)
+  })
+
+/** List documents in a corpus without loading their chunk contents. */
+export const listDocuments = (
+  corpusId: string = DEFAULT_CORPUS_ID
+): Effect.Effect<ReadonlyArray<StoredDocument>, VectorStoreError, VectorStore> =>
+  Effect.gen(function* () {
+    const store = yield* VectorStore
+    return yield* store.listDocuments(corpusId)
+  })
+
+/** Delete a document and every vector derived from it. */
+export const deleteDocument = (
+  documentId: string
+): Effect.Effect<boolean, VectorStoreError, VectorStore> =>
+  Effect.gen(function* () {
+    const store = yield* VectorStore
+    return yield* store.deleteDocument(documentId)
   })

@@ -39,6 +39,48 @@ export interface SearchHit {
   readonly score: number
 }
 
+// ─── Document lifecycle ─────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_CORPUS_ID = "default"
+
+/** Stable identity supplied by a source connector or host application. */
+export interface DocumentSource {
+  readonly corpusId: string
+  readonly sourceType: string
+  readonly sourceId: string
+}
+
+/** Metadata persisted independently from chunks and embeddings. */
+export type DocumentMetadata = Readonly<Record<string, unknown>>
+
+/** A normalized document ready to replace its previous stored version. */
+export interface DocumentDescriptor extends DocumentSource {
+  readonly id: string
+  readonly sourcePath: string
+  readonly kind: MediaKind
+  readonly title: string
+  readonly sourceUrl: string | null
+  /** Hash of normalized content plus embedding model. */
+  readonly contentHash: string
+  readonly embeddingModel: string
+  readonly embeddingDim: number
+  readonly metadata: DocumentMetadata
+}
+
+/** Durable document state returned by lifecycle and listing operations. */
+export interface StoredDocument extends DocumentDescriptor {
+  readonly chunkCount: number
+  readonly createdAt: string
+  readonly updatedAt: string
+}
+
+export type DocumentWriteStatus = "inserted" | "updated"
+
+export interface SearchFilter {
+  readonly corpusId?: string
+  readonly documentIds?: ReadonlyArray<string>
+}
+
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 export class UnsupportedMediaError extends Data.TaggedError("UnsupportedMediaError")<{
@@ -81,7 +123,7 @@ export class ProcessingError extends Data.TaggedError("ProcessingError")<{
 }
 
 export class VectorStoreError extends Data.TaggedError("VectorStoreError")<{
-  readonly operation: "upsert" | "search" | "init"
+  readonly operation: "upsert" | "search" | "init" | "list" | "delete"
   readonly detail: string
   readonly cause?: unknown
 }> {

@@ -3,8 +3,16 @@ import { Effect, Layer, Option } from "effect"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import * as sqliteVec from "sqlite-vec"
-import { VectorStoreError } from "../domain.js"
-import type { EmbeddedChunk, MediaKind, SearchHit } from "../domain.js"
+import { DEFAULT_CORPUS_ID, VectorStoreError } from "../domain.js"
+import type {
+  DocumentDescriptor,
+  DocumentWriteStatus,
+  EmbeddedChunk,
+  MediaKind,
+  SearchFilter,
+  SearchHit,
+  StoredDocument
+} from "../domain.js"
 import { VectorStore } from "../services/VectorStore.js"
 import type { StoreMeta } from "../services/VectorStore.js"
 import { metaOfChunk } from "./memory.js"
@@ -18,6 +26,24 @@ interface ChunkRow {
   readonly text: string
   readonly metadata: string
   readonly embedding: string
+}
+
+interface DocumentRow {
+  readonly id: string
+  readonly corpus_id: string
+  readonly source_type: string
+  readonly source_id: string
+  readonly source_path: string
+  readonly kind: string
+  readonly title: string
+  readonly source_url: string | null
+  readonly content_hash: string
+  readonly embedding_model: string
+  readonly embedding_dim: number
+  readonly metadata: string
+  readonly chunk_count: number
+  readonly created_at: string
+  readonly updated_at: string
 }
 
 const tryStore = <A>(
@@ -41,11 +67,51 @@ const rowToChunk = (row: ChunkRow): EmbeddedChunk => ({
   embedding: JSON.parse(row.embedding) as ReadonlyArray<number>
 })
 
+const rowToDocument = (row: DocumentRow): StoredDocument => ({
+  id: row.id,
+  corpusId: row.corpus_id,
+  sourceType: row.source_type,
+  sourceId: row.source_id,
+  sourcePath: row.source_path,
+  kind: row.kind as MediaKind,
+  title: row.title,
+  sourceUrl: row.source_url,
+  contentHash: row.content_hash,
+  embeddingModel: row.embedding_model,
+  embeddingDim: row.embedding_dim,
+  metadata: JSON.parse(row.metadata) as Readonly<Record<string, unknown>>,
+  chunkCount: row.chunk_count,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+})
+
+const inferredDocument = (chunks: ReadonlyArray<EmbeddedChunk>): DocumentDescriptor | undefined => {
+  const first = chunks[0]
+  if (first === undefined) return undefined
+  const meta = metaOfChunk(first)
+  return {
+    id: first.documentId,
+    corpusId: first.metadata["corpusId"] ?? DEFAULT_CORPUS_ID,
+    sourceType: first.metadata["sourceType"] ?? "legacy",
+    sourceId: first.metadata["sourceId"] ?? first.sourcePath,
+    sourcePath: first.sourcePath,
+    kind: first.kind,
+    title: first.metadata["title"] ?? first.sourcePath,
+    sourceUrl: first.metadata["sourceUrl"] ?? null,
+    contentHash: first.metadata["contentHash"] ?? first.documentId,
+    embeddingModel: meta.model,
+    embeddingDim: meta.dim,
+    metadata: {}
+  }
+}
+
+const documentColumns =
+  "id, corpus_id, source_type, source_id, source_path, kind, title, source_url, content_hash, embedding_model, embedding_dim, metadata, chunk_count, created_at, updated_at"
+
 /**
- * SQLite + sqlite-vec adapter: a single local file, no infra.
- * The vec0 table needs a fixed dimensionality, so the schema is created
- * lazily on first upsert from the first embedding's length (persisted in
- * `meta` and validated afterwards).
+ * SQLite + sqlite-vec adapter. Vector search remains exact and unfiltered in
+ * sqlite-vec, then corpus/document filtering is applied before returning hits.
+ * The future pgvector adapter can push these filters into SQL.
  */
 export const SqliteVectorStoreLive = (
   dbPath: string
@@ -64,6 +130,30 @@ export const SqliteVectorStoreLive = (
         (handle) => Effect.sync(() => handle.close())
       )
 
+      yield* tryStore("init", "failed to initialize document schema", () => {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            corpus_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source_url TEXT,
+            content_hash TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL,
+            metadata TEXT NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(corpus_id, source_type, source_id)
+          );
+          CREATE INDEX IF NOT EXISTS documents_corpus_idx ON documents(corpus_id);
+        `)
+      })
+
       const dimOf = (): number | undefined => {
         const row = db
           .prepare("SELECT value FROM meta WHERE key = 'dim'")
@@ -78,12 +168,14 @@ export const SqliteVectorStoreLive = (
         return row?.value
       }
 
-      const isInitialized = (): boolean => {
+      const tableExists = (name: string): boolean => {
         const row = db
-          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'")
-          .get()
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+          .get(name)
         return row !== undefined
       }
+
+      const isInitialized = (): boolean => tableExists("meta") && tableExists("chunks_vec") && dimOf() !== undefined
 
       const initialize = (dim: number): void => {
         db.exec(`
@@ -98,6 +190,7 @@ export const SqliteVectorStoreLive = (
             metadata TEXT NOT NULL,
             embedding TEXT NOT NULL
           );
+          CREATE INDEX IF NOT EXISTS chunks_document_idx ON chunks(document_id);
           CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
             id TEXT PRIMARY KEY,
             embedding float[${dim}] distance_metric=cosine
@@ -121,96 +214,235 @@ export const SqliteVectorStoreLive = (
           : Effect.void
       }
 
+      const replaceDocument = (
+        document: DocumentDescriptor,
+        chunks: ReadonlyArray<EmbeddedChunk>
+      ): Effect.Effect<DocumentWriteStatus, VectorStoreError> =>
+        Effect.gen(function* () {
+          for (const chunk of chunks) {
+            if (chunk.documentId !== document.id) {
+              return yield* Effect.fail(
+                new VectorStoreError({
+                  operation: "upsert",
+                  detail: `chunk ${chunk.id} belongs to ${chunk.documentId}, expected ${document.id}`
+                })
+              )
+            }
+            const meta = metaOfChunk(chunk)
+            if (meta.model !== document.embeddingModel || meta.dim !== document.embeddingDim) {
+              return yield* Effect.fail(
+                new VectorStoreError({
+                  operation: "upsert",
+                  detail: `chunk ${chunk.id} uses ${meta.model}/${meta.dim}, expected ${document.embeddingModel}/${document.embeddingDim}`
+                })
+              )
+            }
+          }
+
+          yield* tryStore("upsert", "failed to initialize vector schema", () => {
+            if (!isInitialized()) initialize(document.embeddingDim)
+          })
+          yield* checkDim("upsert", document.embeddingDim)
+          const existingModel = yield* tryStore("upsert", "failed to read store meta", modelOf)
+          if (existingModel !== undefined && existingModel !== document.embeddingModel) {
+            return yield* Effect.fail(
+              new VectorStoreError({
+                operation: "upsert",
+                detail: `store was embedded with "${existingModel}", incoming document uses "${document.embeddingModel}" — re-ingest or switch embedder`
+              })
+            )
+          }
+
+          return yield* tryStore("upsert", `failed to replace document ${document.id}`, () => {
+            const existing = db.prepare("SELECT created_at FROM documents WHERE id = ?").get(document.id) as
+              | { created_at: string }
+              | undefined
+            const status: DocumentWriteStatus = existing === undefined ? "inserted" : "updated"
+            const now = new Date().toISOString()
+            db.transaction(() => {
+              db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)").run(document.embeddingModel)
+              db.prepare("DELETE FROM chunks_vec WHERE id IN (SELECT id FROM chunks WHERE document_id = ?)").run(document.id)
+              db.prepare("DELETE FROM chunks WHERE document_id = ?").run(document.id)
+
+              db.prepare(
+                `INSERT INTO documents (${documentColumns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                   corpus_id = excluded.corpus_id,
+                   source_type = excluded.source_type,
+                   source_id = excluded.source_id,
+                   source_path = excluded.source_path,
+                   kind = excluded.kind,
+                   title = excluded.title,
+                   source_url = excluded.source_url,
+                   content_hash = excluded.content_hash,
+                   embedding_model = excluded.embedding_model,
+                   embedding_dim = excluded.embedding_dim,
+                   metadata = excluded.metadata,
+                   chunk_count = excluded.chunk_count,
+                   updated_at = excluded.updated_at`
+              ).run(
+                document.id,
+                document.corpusId,
+                document.sourceType,
+                document.sourceId,
+                document.sourcePath,
+                document.kind,
+                document.title,
+                document.sourceUrl,
+                document.contentHash,
+                document.embeddingModel,
+                document.embeddingDim,
+                JSON.stringify(document.metadata),
+                chunks.length,
+                existing?.created_at ?? now,
+                now
+              )
+
+              const insertChunk = db.prepare(
+                "INSERT INTO chunks (id, document_id, source_path, kind, idx, text, metadata, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+              )
+              const insertVec = db.prepare("INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)")
+              for (const chunk of chunks) {
+                insertChunk.run(
+                  chunk.id,
+                  chunk.documentId,
+                  chunk.sourcePath,
+                  chunk.kind,
+                  chunk.index,
+                  chunk.text,
+                  JSON.stringify(chunk.metadata),
+                  JSON.stringify(chunk.embedding)
+                )
+                insertVec.run(chunk.id, Buffer.from(Float32Array.from(chunk.embedding).buffer))
+              }
+            })()
+            return status
+          })
+        })
+
+      const documentMap = (): ReadonlyMap<string, StoredDocument> => {
+        const rows = db.prepare(`SELECT ${documentColumns} FROM documents`).all() as Array<DocumentRow>
+        return new Map(rows.map((row) => [row.id, rowToDocument(row)]))
+      }
+
+      const matchesFilter = (
+        chunk: EmbeddedChunk,
+        documents: ReadonlyMap<string, StoredDocument>,
+        filter?: SearchFilter
+      ): boolean => {
+        if (filter === undefined) return true
+        if (filter.documentIds !== undefined && !filter.documentIds.includes(chunk.documentId)) return false
+        if (filter.corpusId !== undefined) {
+          const corpusId = documents.get(chunk.documentId)?.corpusId ??
+            chunk.metadata["corpusId"] ?? DEFAULT_CORPUS_ID
+          if (corpusId !== filter.corpusId) return false
+        }
+        return true
+      }
+
       return VectorStore.of({
         upsert: (chunks) =>
-          chunks.length === 0
-            ? Effect.void
-            : Effect.gen(function* () {
-                const first = chunks[0]
-                if (first === undefined) return
-                const incoming = metaOfChunk(first)
-                yield* tryStore("upsert", "failed to initialize schema", () => {
-                  if (!isInitialized()) initialize(first.embedding.length)
-                })
-                yield* checkDim("upsert", first.embedding.length)
-                const existingModel = yield* tryStore("upsert", "failed to read store meta", modelOf)
-                if (existingModel !== undefined && existingModel !== incoming.model) {
-                  return yield* Effect.fail(
-                    new VectorStoreError({
-                      operation: "upsert",
-                      detail: `store was embedded with "${existingModel}", incoming chunks use "${incoming.model}" — re-ingest or switch embedder`
-                    })
-                  )
-                }
-                yield* tryStore("upsert", "failed to record embedding model", () => {
-                  db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)").run(
-                    incoming.model
-                  )
-                })
-                yield* tryStore("upsert", `failed to upsert ${chunks.length} chunks`, () => {
-                  const deleteChunk = db.prepare("DELETE FROM chunks WHERE id = ?")
-                  const deleteVec = db.prepare("DELETE FROM chunks_vec WHERE id = ?")
-                  const insertChunk = db.prepare(
-                    "INSERT INTO chunks (id, document_id, source_path, kind, idx, text, metadata, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                  )
-                  const insertVec = db.prepare("INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)")
-                  db.transaction(() => {
-                    for (const chunk of chunks) {
-                      deleteChunk.run(chunk.id)
-                      deleteVec.run(chunk.id)
-                      insertChunk.run(
-                        chunk.id,
-                        chunk.documentId,
-                        chunk.sourcePath,
-                        chunk.kind,
-                        chunk.index,
-                        chunk.text,
-                        JSON.stringify(chunk.metadata),
-                        JSON.stringify(chunk.embedding)
-                      )
-                      insertVec.run(chunk.id, Buffer.from(Float32Array.from(chunk.embedding).buffer))
-                    }
-                  })()
-                })
-              }),
+          Effect.gen(function* () {
+            const groups = new Map<string, Array<EmbeddedChunk>>()
+            for (const chunk of chunks) {
+              const group = groups.get(chunk.documentId) ?? []
+              group.push(chunk)
+              groups.set(chunk.documentId, group)
+            }
+            for (const group of groups.values()) {
+              const document = inferredDocument(group)
+              if (document !== undefined) yield* replaceDocument(document, group)
+            }
+          }),
 
-        search: (embedding, k) =>
+        replaceDocument,
+
+        search: (embedding, k, filter) =>
           Effect.gen(function* () {
             if (k <= 0) return []
             const ready = yield* tryStore("search", "failed to inspect schema", isInitialized)
             if (!ready) return []
             yield* checkDim("search", embedding.length)
             return yield* tryStore("search", "vector search failed", () => {
+              const total = (db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }).n
+              if (total === 0) return []
+              const candidateCount = filter === undefined ? Math.min(k, total) : total
               const matches = db
-                .prepare(
-                  "SELECT id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance"
-                )
-                .all(Buffer.from(Float32Array.from(embedding).buffer), k) as Array<{
-                id: string
-                distance: number
-              }>
+                .prepare("SELECT id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance")
+                .all(Buffer.from(Float32Array.from(embedding).buffer), candidateCount) as Array<{
+                  id: string
+                  distance: number
+                }>
               const byId = db.prepare(
                 "SELECT id, document_id, source_path, kind, idx, text, metadata, embedding FROM chunks WHERE id = ?"
               )
+              const documents = documentMap()
               const hits: Array<SearchHit> = []
               for (const match of matches) {
                 const row = byId.get(match.id) as ChunkRow | undefined
-                if (row !== undefined) {
-                  hits.push({ chunk: rowToChunk(row), score: 1 - match.distance })
-                }
+                if (row === undefined) continue
+                const chunk = rowToChunk(row)
+                if (!matchesFilter(chunk, documents, filter)) continue
+                hits.push({ chunk, score: 1 - match.distance })
+                if (hits.length >= k) break
               }
               return hits
             })
           }),
 
-        count: Effect.gen(function* () {
-          const ready = yield* tryStore("search", "failed to inspect schema", isInitialized)
-          if (!ready) return 0
-          return yield* tryStore("search", "count failed", () => {
-            const row = db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }
-            return row.n
-          })
-        }),
+        count: (filter) =>
+          Effect.gen(function* () {
+            const ready = yield* tryStore("search", "failed to inspect schema", isInitialized)
+            if (!ready) return 0
+            return yield* tryStore("search", "count failed", () => {
+              if (filter === undefined) {
+                return (db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }).n
+              }
+              const rows = db
+                .prepare("SELECT id, document_id, source_path, kind, idx, text, metadata, embedding FROM chunks")
+                .all() as Array<ChunkRow>
+              const documents = documentMap()
+              return rows.reduce(
+                (count, row) => count + (matchesFilter(rowToChunk(row), documents, filter) ? 1 : 0),
+                0
+              )
+            })
+          }),
+
+        getDocument: (documentId) =>
+          tryStore("list", `failed to read document ${documentId}`, () => {
+            const row = db
+              .prepare(`SELECT ${documentColumns} FROM documents WHERE id = ?`)
+              .get(documentId) as DocumentRow | undefined
+            return row === undefined ? Option.none<StoredDocument>() : Option.some(rowToDocument(row))
+          }),
+
+        listDocuments: (corpusId) =>
+          tryStore("list", `failed to list corpus ${corpusId}`, () => {
+            const rows = db
+              .prepare(`SELECT ${documentColumns} FROM documents WHERE corpus_id = ? ORDER BY updated_at DESC`)
+              .all(corpusId) as Array<DocumentRow>
+            return rows.map(rowToDocument)
+          }),
+
+        deleteDocument: (documentId) =>
+          tryStore("delete", `failed to delete document ${documentId}`, () => {
+            const exists = db.prepare("SELECT 1 FROM documents WHERE id = ?").get(documentId) !== undefined
+            if (!exists) return false
+            db.transaction(() => {
+              const ids = db.prepare("SELECT id FROM chunks WHERE document_id = ?").all(documentId) as Array<{ id: string }>
+              const deleteVec = db.prepare("DELETE FROM chunks_vec WHERE id = ?")
+              for (const row of ids) deleteVec.run(row.id)
+              db.prepare("DELETE FROM chunks WHERE document_id = ?").run(documentId)
+              db.prepare("DELETE FROM documents WHERE id = ?").run(documentId)
+              const remaining = (db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }).n
+              if (remaining === 0) {
+                db.exec("DROP TABLE IF EXISTS chunks_vec")
+                db.prepare("DELETE FROM meta").run()
+              }
+            })()
+            return true
+          }),
 
         meta: Effect.gen(function* () {
           const ready = yield* tryStore("search", "failed to inspect schema", isInitialized)

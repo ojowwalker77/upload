@@ -2,7 +2,8 @@
 import { Args, Command, Options } from "@effect/cli"
 import { NodeContext, NodeRuntime } from "@effect/platform-node"
 import { Console, Effect, Layer, Option } from "effect"
-import { ingestPaths, search } from "./pipeline.js"
+import { DEFAULT_CORPUS_ID } from "./domain.js"
+import { deleteDocument, ingestPaths, listDocuments, search } from "./pipeline.js"
 import { appLayer as makeAppLayer, serverLayer } from "./server.js"
 import { VectorStore } from "./services/VectorStore.js"
 
@@ -20,6 +21,16 @@ const dbOption = Options.text("db").pipe(
 
 const mockOption = Options.boolean("mock").pipe(
   Options.withDescription("force the deterministic offline Gemini layer")
+)
+
+const corpusOption = Options.text("corpus").pipe(
+  Options.withDefault(DEFAULT_CORPUS_ID),
+  Options.withDescription("document corpus / isolation namespace")
+)
+
+const optionalCorpusOption = Options.text("corpus").pipe(
+  Options.optional,
+  Options.withDescription("limit the operation to one corpus")
 )
 
 const transcriberOption = Options.choice("transcriber", ["whisper", "openai", "gemini"]).pipe(
@@ -61,10 +72,11 @@ const ingestCommand = Command.make(
     store: storeOption,
     db: dbOption,
     mock: mockOption,
+    corpus: corpusOption,
     transcriber: transcriberOption,
     embedder: embedderOption
   },
-  ({ db, embedder, mock, paths, store, transcriber }) => {
+  ({ corpus, db, embedder, mock, paths, store, transcriber }) => {
     const app = appLayer({
       store,
       db,
@@ -74,9 +86,10 @@ const ingestCommand = Command.make(
     })
     return Effect.gen(function* () {
       yield* app.note
-      const report = yield* ingestPaths(paths)
+      const report = yield* ingestPaths(paths, { corpusId: corpus })
       for (const r of report.results) {
-        yield* Console.log(`  ✓ ${r.path}  [${r.kind}]  ${r.chunks} chunks  (doc ${r.documentId})`)
+        const marker = r.status === "unchanged" ? "=" : r.status === "updated" ? "↻" : "✓"
+        yield* Console.log(`  ${marker} ${r.path}  [${r.kind}]  ${r.chunks} chunks  (doc ${r.documentId}, ${r.status})`)
       }
       for (const s of report.skipped) {
         yield* Console.log(`  – skipped ${s.path}: ${s.reason}`)
@@ -103,9 +116,10 @@ const searchCommand = Command.make(
     store: storeOption,
     db: dbOption,
     mock: mockOption,
+    corpus: optionalCorpusOption,
     embedder: embedderOption
   },
-  ({ db, embedder, k, mock, query, store }) => {
+  ({ corpus, db, embedder, k, mock, query, store }) => {
     const app = appLayer({
       store,
       db,
@@ -114,7 +128,11 @@ const searchCommand = Command.make(
     })
     return Effect.gen(function* () {
       yield* app.note
-      const hits = yield* search(query, k)
+      const hits = yield* search(
+        query,
+        k,
+        Option.isSome(corpus) ? { corpusId: corpus.value } : undefined
+      )
       if (hits.length === 0) {
         yield* Console.log("no results — ingest something first?")
         return
@@ -133,16 +151,59 @@ const searchCommand = Command.make(
 
 const statusCommand = Command.make(
   "status",
-  { store: storeOption, db: dbOption },
-  ({ db, store }) => {
+  { store: storeOption, db: dbOption, corpus: optionalCorpusOption },
+  ({ corpus, db, store }) => {
     const app = appLayer({ store, db, mock: true })
     return Effect.gen(function* () {
       const vectorStore = yield* VectorStore
-      const n = yield* vectorStore.count
-      yield* Console.log(`${n} chunks stored (${store}${store === "sqlite" ? `: ${db}` : ""})`)
+      const n = yield* vectorStore.count(
+        Option.isSome(corpus) ? { corpusId: corpus.value } : undefined
+      )
+      const scope = Option.isSome(corpus) ? `, corpus: ${corpus.value}` : ""
+      yield* Console.log(`${n} chunks stored (${store}${store === "sqlite" ? `: ${db}` : ""}${scope})`)
     }).pipe(Effect.provide(app.layer))
   }
 ).pipe(Command.withDescription("show stored chunk count"))
+
+// ─── document lifecycle ─────────────────────────────────────────────────────────────
+
+const documentsCommand = Command.make(
+  "documents",
+  { store: storeOption, db: dbOption, corpus: corpusOption },
+  ({ corpus, db, store }) => {
+    const app = appLayer({ store, db, mock: true })
+    return Effect.gen(function* () {
+      const documents = yield* listDocuments(corpus)
+      if (documents.length === 0) {
+        yield* Console.log(`no documents in corpus "${corpus}"`)
+        return
+      }
+      for (const document of documents) {
+        yield* Console.log(
+          `${document.id}  ${document.title}  [${document.kind}]  ${document.chunkCount} chunks  ${document.sourceType}:${document.sourceId}`
+        )
+      }
+    }).pipe(Effect.provide(app.layer))
+  }
+).pipe(Command.withDescription("list documents in a corpus"))
+
+const deleteCommand = Command.make(
+  "delete",
+  {
+    documentId: Args.text({ name: "document-id" }).pipe(
+      Args.withDescription("stable document id returned by ingest/documents")
+    ),
+    store: storeOption,
+    db: dbOption
+  },
+  ({ db, documentId, store }) => {
+    const app = appLayer({ store, db, mock: true })
+    return Effect.gen(function* () {
+      const deleted = yield* deleteDocument(documentId)
+      yield* Console.log(deleted ? `deleted ${documentId}` : `document not found: ${documentId}`)
+    }).pipe(Effect.provide(app.layer))
+  }
+).pipe(Command.withDescription("delete a document and all of its chunks"))
 
 // ─── serve ───────────────────────────────────────────────────────────────────
 
@@ -183,7 +244,14 @@ const serveCommand = Command.make(
 
 const root = Command.make("upload-world").pipe(
   Command.withDescription("multimodal ingest → Gemini embeddings → pluggable vector store"),
-  Command.withSubcommands([ingestCommand, searchCommand, statusCommand, serveCommand])
+  Command.withSubcommands([
+    ingestCommand,
+    searchCommand,
+    statusCommand,
+    documentsCommand,
+    deleteCommand,
+    serveCommand
+  ])
 )
 
 const cli = Command.run(root, { name: "upload-world", version: "0.1.0" })

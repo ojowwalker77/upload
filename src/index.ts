@@ -27,8 +27,16 @@ export { VectorStore } from "./services/VectorStore.js"
 export type { StoreMeta, VectorStoreService } from "./services/VectorStore.js"
 export { MemoryVectorStoreLive } from "./stores/memory.js"
 export { SqliteVectorStoreLive } from "./stores/sqlite.js"
-export { ingestData, ingestPath, ingestPaths, search } from "./pipeline.js"
-export type { IngestReport, IngestResult } from "./pipeline.js"
+export {
+  deleteDocument,
+  documentIdFor,
+  ingestData,
+  ingestPath,
+  ingestPaths,
+  listDocuments,
+  search
+} from "./pipeline.js"
+export type { IngestOptions, IngestReport, IngestResult } from "./pipeline.js"
 export * from "./api.js"
 export { appLayer, makeWebHandler, PipelineHandlersLive, serverLayer, UploadWorldApiLive } from "./server.js"
 export type { AppConfig, TranscriberKind } from "./server.js"

@@ -72,6 +72,73 @@ describe("HTTP API (web handler, mock Gemini, memory store)", () => {
     expect(hits[0]?.sourcePath).toBe("baking.md")
   })
 
+  it("replaces, scopes, lists, and deletes documents through the HTTP API", async () => {
+    const params = new URLSearchParams({
+      filename: "playbook.md",
+      corpus: "http-lifecycle",
+      sourceType: "galeria",
+      sourceId: "file-7",
+      title: "Sales playbook",
+      sourceUrl: "https://example.test/files/7"
+    })
+    const first = await handler(
+      new Request(`${BASE}/ingest/raw?${params}`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: "first playbook version"
+      })
+    )
+    expect(first.status).toBe(200)
+    const firstBody = (await first.json()) as { documentId: string; status: string }
+    expect(firstBody.status).toBe("inserted")
+
+    const second = await handler(
+      new Request(`${BASE}/ingest/raw?${params}`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: "replacement playbook version"
+      })
+    )
+    const secondBody = (await second.json()) as { documentId: string; status: string }
+    expect(secondBody.documentId).toBe(firstBody.documentId)
+    expect(secondBody.status).toBe("updated")
+
+    const documentsResponse = await handler(
+      new Request(`${BASE}/documents?corpus=http-lifecycle`)
+    )
+    expect(documentsResponse.status).toBe(200)
+    const documents = (await documentsResponse.json()) as Array<{
+      id: string
+      sourceId: string
+      chunkCount: number
+    }>
+    expect(documents).toHaveLength(1)
+    expect(documents[0]).toMatchObject({
+      id: firstBody.documentId,
+      sourceId: "file-7",
+      chunkCount: 1
+    })
+
+    const searchResponse = await handler(
+      new Request(`${BASE}/search?q=replacement&corpus=http-lifecycle&k=5`)
+    )
+    const hits = (await searchResponse.json()) as Array<{ documentId: string; text: string }>
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.documentId).toBe(firstBody.documentId)
+    expect(hits[0]?.text).toContain("replacement")
+
+    const deleteResponse = await handler(
+      new Request(`${BASE}/documents/${firstBody.documentId}`, { method: "DELETE" })
+    )
+    expect(deleteResponse.status).toBe(200)
+    expect(await deleteResponse.json()).toEqual({
+      documentId: firstBody.documentId,
+      deleted: true
+    })
+    const afterDelete = await handler(new Request(`${BASE}/documents?corpus=http-lifecycle`))
+    expect(await afterDelete.json()).toEqual([])
+  })
+
   it("reports status", async () => {
     const response = await handler(new Request(`${BASE}/status`))
     expect(response.status).toBe(200)

@@ -1,6 +1,14 @@
 import { Context } from "effect"
 import type { Effect, Option } from "effect"
-import type { EmbeddedChunk, SearchHit, VectorStoreError } from "../domain.js"
+import type {
+  DocumentDescriptor,
+  DocumentWriteStatus,
+  EmbeddedChunk,
+  SearchFilter,
+  SearchHit,
+  StoredDocument,
+  VectorStoreError
+} from "../domain.js"
 
 /** The vector space a store's contents were embedded in. */
 export interface StoreMeta {
@@ -14,19 +22,46 @@ export interface StoreMeta {
  * can satisfy this interface behind a Layer.
  */
 export interface VectorStoreService {
-  /** Insert or replace chunks by id. Replaces all chunks of a re-ingested document. */
+  /**
+   * Legacy low-level chunk write. New ingestion code should use
+   * `replaceDocument`, which also persists identity and lifecycle state.
+   */
   readonly upsert: (
     chunks: ReadonlyArray<EmbeddedChunk>
   ) => Effect.Effect<void, VectorStoreError>
 
+  /** Atomically replace a document record and every chunk belonging to it. */
+  readonly replaceDocument: (
+    document: DocumentDescriptor,
+    chunks: ReadonlyArray<EmbeddedChunk>
+  ) => Effect.Effect<DocumentWriteStatus, VectorStoreError>
+
   /** k-nearest neighbours by cosine similarity. */
   readonly search: (
     embedding: ReadonlyArray<number>,
-    k: number
+    k: number,
+    filter?: SearchFilter
   ) => Effect.Effect<ReadonlyArray<SearchHit>, VectorStoreError>
 
   /** Number of stored chunks (for `status` / sanity checks). */
-  readonly count: Effect.Effect<number, VectorStoreError>
+  readonly count: (
+    filter?: SearchFilter
+  ) => Effect.Effect<number, VectorStoreError>
+
+  /** Retrieve one document by stable id. */
+  readonly getDocument: (
+    documentId: string
+  ) => Effect.Effect<Option.Option<StoredDocument>, VectorStoreError>
+
+  /** List document lifecycle state for one corpus. */
+  readonly listDocuments: (
+    corpusId: string
+  ) => Effect.Effect<ReadonlyArray<StoredDocument>, VectorStoreError>
+
+  /** Delete a document and all of its chunks. Returns whether it existed. */
+  readonly deleteDocument: (
+    documentId: string
+  ) => Effect.Effect<boolean, VectorStoreError>
 
   /**
    * The embedding model + dims this store was populated with (none if empty).

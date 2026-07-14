@@ -5,7 +5,13 @@ import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect } from "vitest"
-import { ingestPaths, search } from "../src/pipeline.js"
+import {
+  deleteDocument,
+  ingestData,
+  ingestPaths,
+  listDocuments,
+  search
+} from "../src/pipeline.js"
 import { EmbedderMock } from "../src/services/EmbedderMock.js"
 import { GeminiMock } from "../src/services/GeminiMock.js"
 import { FfmpegMock, TranscriberMock } from "../src/services/mocks.js"
@@ -67,6 +73,67 @@ describe("pipeline e2e (mock Gemini, memory store)", () => {
       const report = yield* ingestPaths(["/nope/definitely-missing.txt"])
       expect(report.results).toEqual([])
       expect(report.skipped.length).toBe(1)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("replaces changed content and skips an unchanged document", () =>
+    Effect.gen(function* () {
+      const encoder = new TextEncoder()
+      const options = {
+        corpusId: "updates",
+        sourceType: "external",
+        sourceId: "task-42",
+        title: "Task 42",
+        sourceUrl: "https://example.test/tasks/42",
+        metadata: { status: "active", labels: { priority: "high", team: "sales" } }
+      } as const
+
+      const first = yield* ingestData("task.md", encoder.encode("first version"), options)
+      expect(first.status).toBe("inserted")
+      const unchanged = yield* ingestData("task.md", encoder.encode("first version"), {
+        ...options,
+        metadata: { labels: { team: "sales", priority: "high" }, status: "active" }
+      })
+      expect(unchanged.status).toBe("unchanged")
+      expect(unchanged.documentId).toBe(first.documentId)
+
+      const updated = yield* ingestData("task.md", encoder.encode("second version"), options)
+      expect(updated.status).toBe("updated")
+      expect(updated.documentId).toBe(first.documentId)
+
+      const documents = yield* listDocuments("updates")
+      expect(documents).toHaveLength(1)
+      expect(documents[0]?.sourceId).toBe("task-42")
+      expect(documents[0]?.chunkCount).toBe(1)
+      const hits = yield* search("second", 5, { corpusId: "updates" })
+      expect(hits).toHaveLength(1)
+      expect(hits[0]?.chunk.text).toContain("second version")
+
+      expect(yield* deleteDocument(first.documentId)).toBe(true)
+      expect(yield* listDocuments("updates")).toEqual([])
+      expect(yield* search("second", 5, { corpusId: "updates" })).toEqual([])
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("keeps identical source ids isolated between corpora", () =>
+    Effect.gen(function* () {
+      const encoder = new TextEncoder()
+      const alpha = yield* ingestData("shared.md", encoder.encode("alpha secret"), {
+        corpusId: "alpha",
+        sourceType: "file",
+        sourceId: "shared"
+      })
+      const beta = yield* ingestData("shared.md", encoder.encode("beta secret"), {
+        corpusId: "beta",
+        sourceType: "file",
+        sourceId: "shared"
+      })
+      expect(alpha.documentId).not.toBe(beta.documentId)
+
+      const alphaHits = yield* search("secret", 5, { corpusId: "alpha" })
+      expect(alphaHits.map((hit) => hit.chunk.documentId)).toEqual([alpha.documentId])
+      const betaHits = yield* search("secret", 5, { documentIds: [beta.documentId] })
+      expect(betaHits.map((hit) => hit.chunk.documentId)).toEqual([beta.documentId])
     }).pipe(Effect.provide(TestLayer))
   )
 })
